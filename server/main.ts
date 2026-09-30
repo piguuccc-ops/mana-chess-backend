@@ -1,22 +1,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// `node backend.mjs` – the Mana Chess backend: accounts, decks, friends, rooms and the control
-// panel (http://…/admin). Plain HTTP: for HTTPS from anywhere put it behind Nginx Proxy Manager.
+// `node backend.mjs` – the Mana Chess backend: accounts, decks, friends, rooms (port 5454, the
+// one players use) and the control panel on a port of its own (5555, this machine only).
+// Plain HTTP: for HTTPS from anywhere put the backend's port behind Nginx Proxy Manager.
 //
-//   node backend.mjs                     port 8787, data in ./data next to this file
-//   node backend.mjs --port 9000         another port
+//   node backend.mjs                     ports 5454 + 5555, data in ./data next to this file
+//   node backend.mjs --port 9000         another port for the backend
+//   node backend.mjs --admin-port 9001   another port for the control panel
 //   node backend.mjs --data D:\mana      keep the data somewhere else
 //   node backend.mjs --setup             a new one-time admin setup code (lost admin password)
 //   node backend.mjs --no-open           do not open the control panel on the first start
 //
-// The same settings as environment variables (Docker): PORT, HOST, MANA_DATA (the data folder),
-// MANA_PUBLIC_URL (the address players type in, shown in the control panel), MANA_SETUP=1.
-// Needs Node.js 18 or newer, nothing else.
+// The same settings as environment variables (Docker): PORT, HOST, ADMIN_PORT, ADMIN_HOST,
+// MANA_DATA (the data folder), MANA_PUBLIC_URL (the address players type in, shown in the control
+// panel), MANA_SETUP=1. Needs Node.js 18 or newer, nothing else.
 // ─────────────────────────────────────────────────────────────────────────────
 import { spawn } from 'node:child_process';
 import { accessSync, constants, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BUILD_ID, DEFAULT_PORT } from '../src/net/protocol';
+import { ADMIN_PORT, BUILD_ID, DEFAULT_PORT } from '../src/net/protocol';
 import { startBackend } from './index';
 
 const args = process.argv.slice(2);
@@ -26,7 +28,7 @@ const arg = (name: string): string | undefined => {
 };
 
 if (args.includes('--help') || args.includes('-h')) {
-  console.log('Használat: node backend.mjs [--port 8787] [--data <mappa>] [--host 0.0.0.0] [--setup] [--no-open]');
+  console.log('Használat: node backend.mjs [--port 5454] [--admin-port 5555] [--data <mappa>] [--host 0.0.0.0] [--admin-host 127.0.0.1] [--setup] [--no-open]');
   process.exit(0);
 }
 
@@ -35,6 +37,7 @@ const dataDir = resolve(arg('--data') ?? (process.env.MANA_DATA || join(here, 'd
 const dataFile = join(dataDir, 'mana-chess.json');
 const port = Number(arg('--port') ?? process.env.PORT ?? DEFAULT_PORT) || DEFAULT_PORT;
 const host = arg('--host') ?? (process.env.HOST || undefined);
+const adminPort = Number(arg('--admin-port') ?? process.env.ADMIN_PORT ?? ADMIN_PORT) || ADMIN_PORT;
 const publicUrls = (process.env.MANA_PUBLIC_URL ?? '')
   .split(/[\s,]+/)
   .map((u) => u.trim().replace(/\/+$/, ''))
@@ -42,6 +45,9 @@ const publicUrls = (process.env.MANA_PUBLIC_URL ?? '')
 const setupWanted = args.includes('--setup') || /^(1|true|yes|igen)$/i.test(process.env.MANA_SETUP ?? '');
 /** In a container this machine's own addresses are Docker-internal – useless to players. */
 const container = existsSync('/.dockerenv') || existsSync('/run/.containerenv');
+// The control panel: this machine only. In a container it listens on every interface of the
+// container, and docker-compose.yml publishes it on the server's 127.0.0.1 only.
+const adminHost = arg('--admin-host') ?? (process.env.ADMIN_HOST || (container ? '0.0.0.0' : '127.0.0.1'));
 
 // the data folder must be writable – say so plainly instead of failing on the first save
 try {
@@ -84,6 +90,9 @@ startBackend({
   port,
   portTries: arg('--port') || process.env.PORT ? 1 : 10,
   host,
+  adminPort,
+  adminPortTries: arg('--admin-port') || process.env.ADMIN_PORT ? 1 : 10,
+  adminHost,
   publicUrls,
   hideLanAddresses: container,
   dataFile,
@@ -92,13 +101,14 @@ startBackend({
   .then((s) => {
     if (setupWanted) s.accounts.newSetupCode();
     const local = `http://localhost:${s.port}`;
+    const panel = `http://localhost:${s.adminPort}`;
     const code = s.accounts.setupCode;
     // in a container the machine's own addresses are Docker-internal: say what to use instead
     const where = publicUrls.length
       ? publicUrls.map((u, i) => `  ${i === 0 ? 'A játékban megadandó: ' : '                      '}${u}`)
       : container
         ? [
-            '  Konténerben fut: a játékban a szerver gépének címét add meg (pl. 192.168.1.10:8787),',
+            `  Konténerben fut: a játékban a szerver gépének címét add meg (pl. 192.168.1.10:${s.port}),`,
             '  interneten a https-es címét. A vezérlőpulton megjelenő cím: MANA_PUBLIC_URL.',
           ]
         : s.lanUrls.length
@@ -112,7 +122,12 @@ startBackend({
       '',
       `  Ezen a gépen:        ${local}`,
       ...where,
-      `  Vezérlőpult:         ${local}/admin${container ? '   (a konténeren kívülről: http://<a szerver címe>:<port>/admin)' : ''}`,
+      ...(container
+        ? [
+            `  Vezérlőpult:         a szerveren http://127.0.0.1:${s.adminPort}  (külön port, csak a szerver gépéről;`,
+            '                       máshonnan SSH-alagúttal vagy Tailscale-lel – lásd DEPLOY.md)',
+          ]
+        : [`  Vezérlőpult:         ${panel}   (külön port, csak erről a gépről)`]),
       '',
       ...(code
         ? [
@@ -126,7 +141,7 @@ startBackend({
           ]
         : []),
       '  Interneten HTTPS-sel: Nginx Proxy Manager -> Proxy Host -> Forward: ennek a gépnek',
-      `  (vagy konténernek) a címe, port ${s.port}, SSL: Let's Encrypt.`,
+      `  (vagy konténernek) a címe, port ${s.port}, SSL: Let's Encrypt. A vezérlőpult portját (${s.adminPort}) ne!`,
       ...(container ? [] : ['  Ha a Windows tűzfal rákérdez, engedélyezd a Node.js-t.']),
       '',
       `  Adatok: ${dataFile}`,
@@ -136,7 +151,7 @@ startBackend({
       '',
     ];
     console.log(lines.join('\n'));
-    if (code && !args.includes('--no-open')) openBrowser(`${local}/admin`);
+    if (code && !args.includes('--no-open')) openBrowser(panel);
     let stopping = false;
     const stop = () => {
       if (stopping) return;
@@ -153,7 +168,9 @@ startBackend({
     const uid = typeof process.getuid === 'function' ? process.getuid() : null;
     console.error(
       e.code === 'EADDRINUSE'
-        ? `\n  A(z) ${port}. port foglalt – fut már egy szerver? Próbáld: node backend.mjs --port ${port + 100}\n`
+        ? (e as NodeJS.ErrnoException & { what?: string }).what === 'admin'
+          ? `\n  A vezérlőpult ${adminPort}. portja foglalt – fut már egy szerver? Próbáld: node backend.mjs --admin-port ${adminPort + 100}\n`
+          : `\n  A(z) ${port}. port foglalt – fut már egy szerver? Próbáld: node backend.mjs --port ${port + 100}\n`
         : e.code === 'MANA_DATA_UNREADABLE'
           ? [
               '',

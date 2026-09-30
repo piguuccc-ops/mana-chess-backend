@@ -2,6 +2,8 @@
   "name": "mana-chess-backend",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
+  "author": "piguuccc-ops",
   "description": "Mana Chess backend: accounts, server-side decks, friends, challenges, game rooms and a web control panel",
   "type": "module",
   "engines": {

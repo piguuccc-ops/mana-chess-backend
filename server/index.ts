@@ -5,21 +5,29 @@
 // page itself is served by the separate frontend server (frontend.ts) or opened from a file.
 // No packages needed; the command line lives in main.ts.
 //
-//   GET  /                         a short page: what this is, the control panel link
-//   GET  /admin                    the control panel
+// Two listeners, one server:
+//
+//  the backend (port 5454) – what players use, the one to put on the internet:
+//   GET  /                         a short page: what this is
 //   GET  /api/info                 name, version, registration mode, guest play
 //   GET  /api/rooms                open rooms
-//   POST /api/rooms                open a room                 {auth?, name, deck, …}
-//   POST /api/rooms/:code/(join|state|poll|action|draw|rematch|leave)
+//   POST /api/rooms                open a room                 {auth?, name, deck, draft?, …}
+//   POST /api/rooms/:code/(join|state|poll|action|draw|rematch|leave|pick)
 //   POST /api/auth/(register|login|logout)
 //   POST /api/me, /api/me/poll, /api/me/password
 //   POST /api/decks/(save|delete)
 //   POST /api/friends/(search|request|accept|decline|cancel|remove)
 //   POST /api/challenges/(send|accept|decline|cancel)
-//   POST /api/admin/…              the control panel's calls (admin accounts only)
+//
+//  the control panel (port 5555) – keep it on the server's own machine (or a private network such
+//  as Tailscale); nothing of it exists on the backend's port:
+//   GET  /, /admin                 the control panel
+//   POST /api/auth/(login|logout)  admin accounts only
+//   POST /api/admin/…              the control panel's calls
 //
 // Requests are JSON sent as text/plain and the session token travels in the body, so a page
-// from any address (or a file) talks to the server without CORS preflights or cookies.
+// from any address (or a file) talks to the backend without CORS preflights or cookies. The
+// control panel answers its own page only (no CORS).
 // ─────────────────────────────────────────────────────────────────────────────
 import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -36,6 +44,11 @@ export interface BackendOptions {
   /** Tries the next ports when the first one is taken. */
   portTries?: number;
   host?: string;
+  /** The control panel's own port (0: any free one); null or left out: no control panel. */
+  adminPort?: number | null;
+  adminPortTries?: number;
+  /** Where the control panel listens (default 127.0.0.1: this machine only). */
+  adminHost?: string;
   /**
    * The address(es) players use to reach this server, when the machine's own addresses mean
    * nothing to them (in a Docker container, behind a proxy): shown in the control panel and the log.
@@ -51,10 +64,13 @@ export interface BackendOptions {
 
 export interface RunningBackend {
   server: Server;
+  /** The control panel's listener (null: none). */
+  adminServer: Server | null;
   lobby: Lobby;
   accounts: Accounts;
   store: Store;
   port: number;
+  adminPort: number | null;
   /** http://… addresses on this machine's network interfaces (LAN first). */
   lanUrls: string[];
   close(): Promise<void>;
@@ -76,22 +92,27 @@ export function lanAddresses(): string[] {
   return [...new Set(out)].sort((a, b) => rank(a) - rank(b));
 }
 
-function headers(extra: Record<string, string> = {}): Record<string, string> {
+/** The backend's answers may be read by the game page from any address (CORS). */
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Max-Age': '86400',
+};
+
+function headers(extra: Record<string, string> = {}, cors = true): Record<string, string> {
   return {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Max-Age': '86400',
+    ...(cors ? CORS : {}),
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
     ...extra,
   };
 }
 
-function send(res: ServerResponse, status: number, body: unknown): void {
+function send(res: ServerResponse, status: number, body: unknown, cors = true): void {
   if (res.writableEnded || res.destroyed) return;
   const text = JSON.stringify(body);
-  res.writeHead(status, headers({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': String(Buffer.byteLength(text)) }));
+  res.writeHead(status, headers({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': String(Buffer.byteLength(text)) }, cors));
   res.end(text);
 }
 
@@ -131,6 +152,13 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 }
 
 const NO_AUTH = { ok: false, error: 'A bejelentkezés lejárt – lépj be újra.', auth: false };
+
+/** The backend's calls that need a signed-in player. */
+const SESSION_PATHS = new Set([
+  '/api/me', '/api/me/poll', '/api/me/password', '/api/decks/save', '/api/decks/delete',
+  '/api/friends/search', '/api/friends/request', '/api/friends/accept', '/api/friends/decline', '/api/friends/cancel', '/api/friends/remove',
+  '/api/challenges/send', '/api/challenges/accept', '/api/challenges/decline', '/api/challenges/cancel',
+]);
 
 export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
   const now = opts.now ?? (() => Date.now());
@@ -176,6 +204,7 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
     return u ? { id: u.id, name: u.name } : null;
   };
 
+  /** The backend: everything players use. */
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const path = url.pathname.replace(/\/+$/, '') || '/';
@@ -191,9 +220,9 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
     if (!requests.take(ip)) return send(res, 429, { ok: false, error: 'Túl sok kérés – lassíts egy kicsit.' });
 
     if (method === 'GET') {
-      if (path === '/' || path === '/admin') {
+      if (path === '/') {
         const nonce = randomBytes(12).toString('base64');
-        return sendPage(res, path === '/' ? landingPage(nonce, info()) : adminPage(nonce), nonce);
+        return sendPage(res, landingPage(nonce, info()), nonce);
       }
       if (path === '/favicon.ico') {
         res.writeHead(204, headers());
@@ -212,7 +241,7 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
       const m = memberOf(body.auth);
       return send(res, 200, m === null ? NO_AUTH : lobby.create(body, m ?? null));
     }
-    const room = /^\/api\/rooms\/([A-Za-z]{4})\/(join|state|poll|action|draw|rematch|leave)$/.exec(path);
+    const room = /^\/api\/rooms\/([A-Za-z]{4})\/(join|state|poll|action|draw|rematch|leave|pick)$/.exec(path);
     if (room) {
       const [, code, verb] = room;
       const tok = typeof body.token === 'string' ? body.token : '';
@@ -236,6 +265,8 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
           return send(res, 200, lobby.rematch(code, tok));
         case 'leave':
           return send(res, 200, lobby.leave(code, tok));
+        case 'pick':
+          return send(res, 200, lobby.pick(code, body));
       }
     }
 
@@ -248,14 +279,10 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
         return send(res, 200, await accounts.login(body, ip));
       case '/api/auth/logout':
         return send(res, 200, accounts.logout(body.token));
-      case '/api/admin/setup':
-        return send(res, 200, await accounts.setup(body, ip));
-      case '/api/admin/status':
-        // the control panel's first question: set up an admin, or sign in?
-        return send(res, 200, { ok: true, setup: !!accounts.setupCode, recovery: !!accounts.setupCode && accounts.hasAdmin(), name: store.data.settings.serverName });
     }
 
-    // ── everything else needs a session ──
+    // ── everything else needs a session (and anything unknown – the control panel's calls too – is not here) ──
+    if (!SESSION_PATHS.has(path)) return send(res, 404, { ok: false, error: 'Nincs ilyen cím.' });
     const user = accounts.session(body.token);
     if (!user) return send(res, 200, NO_AUTH);
     const token = body.token as string;
@@ -291,10 +318,55 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
       case '/api/challenges/cancel':
         return send(res, 200, accounts.cancelChallenge(user, body));
     }
+    return send(res, 404, { ok: false, error: 'Nincs ilyen cím.' });
+  };
 
-    // ── the control panel ──
+  /** The control panel: its page, signing in (admins only), and its calls. */
+  const handleAdmin = async (req: IncomingMessage, res: ServerResponse) => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const path = url.pathname.replace(/\/+$/, '') || '/';
+    const method = req.method ?? 'GET';
+    const ip = clientIp(req, store.data.settings.trustProxy);
+    const answer = (status: number, body: unknown) => send(res, status, body, false);
+    if (!requests.take(ip)) return answer(429, { ok: false, error: 'Túl sok kérés – lassíts egy kicsit.' });
+
+    if (method === 'GET') {
+      if (path === '/' || path === '/admin') {
+        const nonce = randomBytes(12).toString('base64');
+        return sendPage(res, adminPage(nonce), nonce);
+      }
+      if (path === '/favicon.ico') {
+        res.writeHead(204, headers({}, false));
+        res.end();
+        return;
+      }
+      return answer(404, { ok: false, error: 'Nincs ilyen cím.' });
+    }
+    if (method !== 'POST') return answer(405, { ok: false, error: 'Nem támogatott kérés.' });
+    const body = await readBody(req);
+    switch (path) {
+      case '/api/auth/login': {
+        const r = await accounts.login(body, ip);
+        if (r.ok && r.me.user.role !== 'admin') {
+          accounts.logout(r.token);
+          return answer(200, { ok: false, error: 'Ez a fiók nem adminisztrátor – a vezérlőpultba csak adminisztrátor léphet be.' });
+        }
+        return answer(200, r);
+      }
+      case '/api/auth/logout':
+        return answer(200, accounts.logout(body.token));
+      case '/api/admin/setup':
+        return answer(200, await accounts.setup(body, ip));
+      case '/api/admin/status':
+        // the control panel's first question: set up an admin, or sign in?
+        return answer(200, { ok: true, setup: !!accounts.setupCode, recovery: !!accounts.setupCode && accounts.hasAdmin(), name: store.data.settings.serverName });
+    }
+    const user = accounts.session(body.token);
+    if (!user) return answer(200, NO_AUTH);
     if (path.startsWith('/api/admin/')) {
-      if (user.role !== 'admin') return send(res, 200, { ok: false, error: 'Ehhez adminisztrátori jog kell.' });
+      if (user.role !== 'admin') return answer(200, { ok: false, error: 'Ehhez adminisztrátori jog kell.' });
+      // the calls below answer the panel's own page only: no CORS headers
+      const send = (_res: ServerResponse, status: number, b: unknown) => answer(status, b);
       switch (path) {
         case '/api/admin/overview':
           return send(res, 200, {
@@ -333,7 +405,7 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
         }
       }
     }
-    return send(res, 404, { ok: false, error: 'Nincs ilyen cím.' });
+    return answer(404, { ok: false, error: 'Nincs ilyen cím.' });
   };
 
   /** Long poll on a room: answers at once if there is news, otherwise when news arrives or after POLL_WAIT_MS. */
@@ -381,6 +453,16 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
   });
   server.headersTimeout = 20_000;
   server.requestTimeout = 60_000;
+  const adminServer =
+    opts.adminPort === undefined || opts.adminPort === null
+      ? null
+      : createServer((req, res) => {
+          handleAdmin(req, res).catch((e: Error) => send(res, 400, { ok: false, error: e.message || 'Hiba.' }, false));
+        });
+  if (adminServer) {
+    adminServer.headersTimeout = 20_000;
+    adminServer.requestTimeout = 60_000;
+  }
   const ticker = setInterval(() => {
     lobby.tick();
     accounts.tick();
@@ -389,39 +471,56 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
   }, 3000);
   ticker.unref?.();
 
-  return new Promise((resolve, reject) => {
-    let tries = opts.portTries ?? 1;
-    const attempt = () => {
-      server.once('error', (e: NodeJS.ErrnoException) => {
-        if (e.code === 'EADDRINUSE' && --tries > 0) {
-          port += 1;
-          attempt();
-        } else {
-          clearInterval(ticker);
-          reject(e);
-        }
-      });
-      server.listen(port, opts.host ?? '0.0.0.0', () => {
-        server.removeAllListeners('error');
-        const addr = server.address();
-        if (addr && typeof addr === 'object') port = addr.port;
-        resolve({
-          server,
-          lobby,
-          accounts,
-          store,
-          port,
-          lanUrls: reachable(),
-          close: () =>
-            new Promise<void>((done) => {
-              clearInterval(ticker);
-              store.flush();
-              server.closeAllConnections?.();
-              server.close(() => done());
-            }),
+  /** Listens on `first` (or the next free ports, `tries` in all); resolves with the port it got. */
+  const listen = (srv: Server, first: number, host: string, tries: number, what: string) =>
+    new Promise<number>((resolve, reject) => {
+      let at = first;
+      let left = tries;
+      const attempt = () => {
+        srv.once('error', (e: NodeJS.ErrnoException) => {
+          if (e.code === 'EADDRINUSE' && --left > 0) {
+            at += 1;
+            attempt();
+          } else reject(Object.assign(e, { what }));
         });
-      });
-    };
-    attempt();
-  });
+        srv.listen(at, host, () => {
+          srv.removeAllListeners('error');
+          const addr = srv.address();
+          resolve(addr && typeof addr === 'object' ? addr.port : at);
+        });
+      };
+      attempt();
+    });
+  const closeServer = (srv: Server | null) =>
+    new Promise<void>((done) => {
+      if (!srv || !srv.listening) return done();
+      srv.closeAllConnections?.();
+      srv.close(() => done());
+    });
+
+  return (async () => {
+    try {
+      port = await listen(server, port, opts.host ?? '0.0.0.0', opts.portTries ?? 1, 'backend');
+      const adminPort = adminServer ? await listen(adminServer, opts.adminPort!, opts.adminHost ?? '127.0.0.1', opts.adminPortTries ?? 1, 'admin') : null;
+      return {
+        server,
+        adminServer,
+        lobby,
+        accounts,
+        store,
+        port,
+        adminPort,
+        lanUrls: reachable(),
+        close: async () => {
+          clearInterval(ticker);
+          store.flush();
+          await Promise.all([closeServer(server), closeServer(adminServer)]);
+        },
+      };
+    } catch (e) {
+      clearInterval(ticker);
+      await Promise.all([closeServer(server), closeServer(adminServer)]);
+      throw e;
+    }
+  })();
 }

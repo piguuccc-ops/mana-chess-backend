@@ -423,16 +423,19 @@ describe('the client address behind a proxy', () => {
 describe('over HTTP', () => {
   let srv: RunningBackend;
   let base = '';
+  let panel = '';
   beforeAll(async () => {
-    srv = await startBackend({ port: 0, host: '127.0.0.1', dataFile: null });
+    srv = await startBackend({ port: 0, host: '127.0.0.1', adminPort: 0, adminHost: '127.0.0.1', dataFile: null });
     srv.store.data.settings.registration = 'open';
     base = `http://127.0.0.1:${srv.port}`;
+    panel = `http://127.0.0.1:${srv.adminPort}`;
   });
   afterAll(() => srv.close());
-  const post = (path: string, body: unknown) => fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(body) }).then((r) => r.json());
+  const post = (path: string, body: unknown, at = base) => fetch(at + path, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(body) }).then((r) => r.json());
 
-  it('pages: the landing page and the control panel, with a strict CSP', async () => {
-    const admin = await fetch(`${base}/admin`);
+  it('the control panel lives on its own port only, with a strict CSP and no CORS', async () => {
+    expect(srv.adminPort).not.toBe(srv.port);
+    const admin = await fetch(`${panel}/admin`);
     const csp = admin.headers.get('content-security-policy') ?? '';
     expect(csp).toMatch(/script-src 'nonce-/);
     expect(csp).toMatch(/frame-ancestors 'none'/);
@@ -440,9 +443,37 @@ describe('over HTTP', () => {
     const nonce = /nonce-([^']+)'/.exec(csp)![1];
     expect(html).toContain(`<script nonce="${nonce}">`);
     expect(html).toContain('function adminApp');
-    expect((await fetch(`${base}/`)).status).toBe(200);
-    expect(await post('/api/admin/status', {})).toMatchObject({ ok: true, setup: true });
-    expect(await post('/api/admin/overview', { token: 'nincs-ilyen-token-nincs' })).toMatchObject({ ok: false, auth: false });
+    expect((await fetch(`${panel}/`)).status).toBe(200); // the panel's own root is the panel
+    const status = await fetch(`${panel}/api/admin/status`, { method: 'POST', body: '{}' });
+    expect(status.headers.get('access-control-allow-origin')).toBeNull();
+    expect(await status.json()).toMatchObject({ ok: true, setup: true });
+    expect(await post('/api/admin/overview', { token: 'nincs-ilyen-token-nincs' }, panel)).toMatchObject({ ok: false, auth: false });
+    // nothing of it on the backend's port – the one that goes on the internet
+    const landing = await fetch(`${base}/`);
+    expect(landing.status).toBe(200);
+    expect(await landing.text()).not.toContain('/admin');
+    expect((await fetch(`${base}/admin`)).status).toBe(404);
+    for (const p of ['/api/admin/status', '/api/admin/setup', '/api/admin/overview', '/api/admin/users/delete']) {
+      const r = await fetch(base + p, { method: 'POST', body: '{}' });
+      expect(r.status).toBe(404);
+    }
+  });
+
+  it('the control panel lets only admins sign in', async () => {
+    const code = srv.accounts.setupCode!;
+    const made = await post('/api/admin/setup', { code, name: 'Gazda', password: 'gazda123' }, panel);
+    expect(made.ok).toBe(true);
+    expect((await post('/api/auth/login', { name: 'Gazda', password: 'gazda123' }, panel)).ok).toBe(true);
+    await httpRegister(base, 'Jatekos', 'titok123');
+    const player = await post('/api/auth/login', { name: 'Jatekos', password: 'titok123' }, panel);
+    expect(player).toMatchObject({ ok: false, error: expect.stringMatching(/nem adminisztrátor/) });
+    // the player's own session (from the game) is no key to the panel either
+    const own = await httpLogin(base, 'Jatekos', 'titok123');
+    expect(own.ok).toBe(true);
+    expect(await post('/api/admin/overview', { token: own.ok ? own.token : '' }, panel)).toMatchObject({ ok: false, error: expect.stringMatching(/adminisztrátori jog/) });
+    // the admin's calls work on the panel's port
+    const admin = await post('/api/auth/login', { name: 'Gazda', password: 'gazda123' }, panel);
+    expect((await post('/api/admin/overview', { token: admin.token }, panel)).ok).toBe(true);
   });
 
   it('register, sign in, friends and a challenge through the client classes and the live stream', async () => {

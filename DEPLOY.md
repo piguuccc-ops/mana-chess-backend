@@ -6,19 +6,22 @@ separate, locked-down containers, and Docker downloads the images from GitHub:
 ```
 ~/mana-chess/docker-compose.yml   starts:
 
-  mana-chess-frontend   port 8080   the game page
-  mana-chess-backend    port 8787   accounts, decks, friends, rooms, the /admin control panel
-     └─ Docker volume "mana-chess-data": mana-chess.json – every account, deck and setting
+  mana-chess-frontend   port 4545   the game page
+  mana-chess-backend    port 5454   accounts, decks, friends, rooms – what players use
+                        port 5555   the control panel – on the server only (127.0.0.1)
+     └─ Docker volume "mana-chess-data": mana-chess.json – every account, password, deck and setting
 
-At home:          http://SERVER-IP:8080  (the page finds the backend at SERVER-IP:8787 by itself)
-On the internet:  https://sakk.example.com      → Nginx Proxy Manager → port 8080
-                  https://sakk-api.example.com  → Nginx Proxy Manager → port 8787
+At home:          http://SERVER-IP:4545  (the page finds the backend at SERVER-IP:5454 by itself)
+On the internet:  https://sakk.example.com      → Nginx Proxy Manager → port 4545
+                  https://sakk-api.example.com  → Nginx Proxy Manager → port 5454
+Control panel:    http://127.0.0.1:5555 on the server – from your PC through SSH or Tailscale (step 4)
 ```
 
 `SERVER-IP` is the server's address on your home network, e.g. `192.168.1.10` (`hostname -I` shows it).
 `sakk.example.com` and `sakk-api.example.com` stand for your own domain names.
 
 **Step 1 is done once, by you, on GitHub.** After that, installing on any server is only steps 2–4.
+Updating later: step 6.
 
 ---
 
@@ -128,23 +131,45 @@ containers as **healthy**.
 
 ---
 
-## 4. Create your admin account
+## 4. The control panel and your admin account
 
-The first start prints a one-time **setup code** in the backend's log:
+The control panel has a port of its own, **5555**, and it listens only on the server itself
+(`127.0.0.1`). Nothing of it exists on the backend's port 5454 – the one that goes on the internet – so
+nobody can even try an admin password from outside.
+
+**Open it from your PC** – pick one:
+
+- **SSH tunnel** (works everywhere). On your PC, in Terminal or PowerShell, keep this window open:
+
+  ```bash
+  ssh -L 5555:127.0.0.1:5555 YOUR-USER@SERVER-IP
+  ```
+
+  Then open `http://localhost:5555` in your PC's browser.
+- **Tailscale** (if the server is in your tailnet). Once, on the server:
+
+  ```bash
+  sudo tailscale serve --bg --https=5555 http://127.0.0.1:5555
+  ```
+
+  From then on, any of your own Tailscale devices opens `https://SERVER-NAME.YOUR-TAILNET.ts.net:5555`
+  (`tailscale serve status` prints the exact address). Only devices in your tailnet reach it. If it asks
+  you to enable HTTPS certificates, open the link it prints. To switch it off again:
+  `sudo tailscale serve --https=5555 off`. Never use `tailscale funnel` for it: that would put it on the
+  internet.
+- **On the server itself**, if it has a desktop: `http://127.0.0.1:5555`.
+
+**Create your admin account.** The first start prints a one-time **setup code** in the backend's log:
 
 ```bash
 docker compose logs backend | grep BEÁLLÍTÓKÓD
 ```
 
 The line looks like `BEÁLLÍTÓKÓD:  7KQ2-M4XP`. If you see several lines, the last one is valid (each start
-before setup makes a new code).
+before setup makes a new code). In the control panel, enter the code, then choose your admin name and
+password. The code works once.
 
-1. Open `http://SERVER-IP:8787/admin` in your browser.
-2. Enter the code, then choose your admin name and password.
-
-The code works once. It proves you are the one running the server.
-
-The control panel has several tabs:
+The control panel accepts only admin accounts. Its tabs:
 - **Beállítások** (Settings):
   - server name;
   - registration: *closed*, *with approval* (the default) or *open* (accepted automatically);
@@ -154,10 +179,14 @@ The control panel has several tabs:
   reset passwords, delete users.
 - **Biztonság** (Security): locked accounts and banned addresses, each with an unlock button.
 
-**Play on the home network:** open `http://SERVER-IP:8080` and go to **Online**. The game finds the
-backend at `SERVER-IP:8787` by itself. Choose **Belépés** (sign in), **Regisztráció** (register) or
+**Play on the home network:** open `http://SERVER-IP:4545` and go to **Online**. The game finds the
+backend at `SERVER-IP:5454` by itself. Choose **Belépés** (sign in), **Regisztráció** (register) or
 **Vendégként** (play as a guest: no account, decks stay in the browser). Phones on the same Wi-Fi use the
 same address.
+
+**Game modes.** In the game, **Csatába! → Paklik** (and online in a room or a challenge) you choose
+between your own decks and **Spell-toborzás**: 32 random spells on an 8 × 4 table, the two players take
+one each in turn until both have 6.
 
 ---
 
@@ -169,22 +198,22 @@ them. Players then reach everything on port 443, even on networks that only let 
 **First, on the router and in DNS:**
 - Point two DNS names at your public IP address: `sakk.example.com` for the game and
   `sakk-api.example.com` for the backend.
-- Forward only ports **80 and 443**, to NPM. Never forward 8787 or 8080.
+- Forward only ports **80 and 443**, to NPM. Never forward 4545, 5454 or 5555.
 
 **In NPM**, go to **Hosts → Proxy Hosts → Add Proxy Host** and add two hosts:
 
-| | Backend | Game page |
+| | Game page | Backend |
 |---|---|---|
-| Domain Names | `sakk-api.example.com` | `sakk.example.com` |
+| Domain Names | `sakk.example.com` | `sakk-api.example.com` |
 | Scheme | `http` | `http` |
 | Forward Hostname / IP | `SERVER-IP` | `SERVER-IP` |
-| Forward Port | `8787` | `8080` |
+| Forward Port | `4545` | `5454` |
 | Block Common Exploits | on | on |
 | SSL tab | Request a new SSL Certificate, **Force SSL**, HTTP/2, HSTS | the same |
 
 Use the server's network address (`SERVER-IP`) even when NPM runs in Docker on the same server. Don't
 use `localhost` or `127.0.0.1`: inside NPM's container those mean NPM itself. Websockets support isn't
-needed, because the game uses ordinary HTTP requests.
+needed, because the game uses ordinary HTTP requests. **Never make a proxy host for port 5555.**
 
 **Then tell the game page where the backend is.** In `~/mana-chess/docker-compose.yml`, fill in the two
 empty addresses:
@@ -200,56 +229,85 @@ Apply the change with `docker compose up -d`. This recreates the containers, and
 **Why the backend needs https too:** a page opened over https may not talk to an http address, because
 the browser blocks it. So on the internet, always use the backend's `https://` address.
 
-### Optional: keep the control panel off the internet
-
-You can make the control panel reachable only from home. In the backend's proxy host, open the
-**Advanced** tab and add:
-
-```nginx
-location = /admin { return 403; }
-location ^~ /api/admin/ { return 403; }
-```
-
-Players are unaffected. You then manage the server at `http://SERVER-IP:8787/admin` from home.
-
 ### Optional: a server with a public IP (VPS), or no open ports at all
 
 Docker's published ports get past UFW. On a server that is directly on the internet, don't publish
-8787 and 8080 to the world:
+4545 and 5454 to the world (5555 is already on `127.0.0.1` only):
 
-1. In `docker-compose.yml`, change the two port lines to `"127.0.0.1:8787:8787"` and
-   `"127.0.0.1:8080:8080"`.
+1. In `docker-compose.yml`, change the two port lines to `"127.0.0.1:5454:5454"` and
+   `"127.0.0.1:4545:4545"`.
 2. If NPM runs in Docker on the same server, it can't reach `127.0.0.1` of the server. Put the containers
    on NPM's network instead. Find its name with `docker network ls` (usually `npm_default` or
    `nginx-proxy-manager_default`). Then follow the **NPM-NETWORK** note at the end of `docker-compose.yml`:
    remove the `# ` from the marked lines and put the network name after `name:`.
 3. Run `docker compose up -d`.
-4. In the two proxy hosts, set **Forward Hostname** to `mana-chess-backend` (port `8787`) and
-   `mana-chess-frontend` (port `8080`).
-
-To reach the control panel then, use an SSH tunnel from your PC: `ssh -L 8787:127.0.0.1:8787 USER@SERVER`,
-then open `http://localhost:8787/admin`.
+4. In the two proxy hosts, set **Forward Hostname** to `mana-chess-frontend` (port `4545`) and
+   `mana-chess-backend` (port `5454`).
 
 ---
 
-## 6. Everyday tasks
+## 6. Updating – accounts, decks and passwords stay
+
+Everything that matters lives in the Docker volume `mana-chess-data`: every account, every password (as a
+scrypt hash), the decks saved on the server, friends and settings. Updating replaces only the programs;
+the volume is never touched. Two more things to know:
+- Decks made **as a guest** live in each player's browser, tied to the game page's address. Keep the
+  same address (`http://SERVER-IP:4545`, or your domain) and they stay too.
+- Games in progress end when the backend restarts. Update when nobody is playing.
+
+**The update, when you have pushed new code to GitHub (or the weekly rebuild ran):**
+
+1. Wait for the green ticks of the **Docker image** workflow in **both** repositories.
+2. On the server, make a backup first (it takes a second):
+
+   ```bash
+   cd ~/mana-chess
+   mkdir -p ~/mana-chess-backups
+   docker compose cp backend:/data/mana-chess.json ~/mana-chess-backups/before-update-$(date +%F).json
+   ```
+
+3. If the new version comes with a new `docker-compose.yml` (its release notes say so), fetch it. Your old
+   one is kept as `docker-compose.old.yml`; copy your own changes (the two addresses of step 5, ports)
+   into the new file:
+
+   ```bash
+   cp docker-compose.yml docker-compose.old.yml
+   curl -fsSLO https://raw.githubusercontent.com/piguuccc-ops/mana-chess-backend/main/docker-compose.yml
+   ```
+
+   **Coming from the first version** (ports 8787 and 8080 inside the containers, control panel at
+   `/admin`)? Then this step is a must: the ports inside the containers changed to 5454 and 4545, and the
+   control panel moved to its own port, 5555. With the old file the game could not reach the backend.
+   The volume name is the same (`mana-chess-data`), so all accounts and decks are still there.
+
+4. Download and start the new version:
+
+   ```bash
+   docker compose pull && docker compose up -d && docker image prune -f
+   ```
+
+5. Check: `docker compose ps` shows both **healthy**, and you can sign in.
+
+Always update the backend and the game page **together** (the command above does): the backend turns
+away a game page built with different rules, and says so. **Never run `docker compose down -v`**: the
+`-v` deletes the data volume, which holds every account.
+
+To go back to an older version, put its tag (e.g. `:1.0.0`) in both `image:` lines and run
+`docker compose up -d`. If the data itself must go back, restore the backup (step 7).
+
+---
+
+## 7. Everyday tasks
 
 Run these in `~/mana-chess`:
 
 | Task | Command |
 |---|---|
-| Update to the newest version | `docker compose pull && docker compose up -d && docker image prune -f` |
 | State and health | `docker compose ps` |
 | Watch the backend's log | `docker compose logs -f backend` (Ctrl+C to stop watching) |
 | Restart / stop / start | `docker compose restart` · `docker compose stop` · `docker compose up -d` |
 | Change a setting | `nano docker-compose.yml`, then `docker compose up -d` |
 | Remove the containers (data stays) | `docker compose down` |
-
-**Never run `docker compose down -v`.** The `-v` deletes the data volume, which holds every account.
-
-**Pinning a version.** Change `:latest` to a version, e.g. `:1.0.0`, in both `image:` lines, and update on
-purpose. Always run the backend and the game page from the **same release**: the backend turns away pages
-built with different rules, and shows a clear message saying so.
 
 **Backup.** All accounts, decks, friends and settings are in one file. The server writes it atomically,
 so you can copy it at any time:
@@ -276,7 +334,6 @@ docker compose up -d
 
 The `-a` matters: it gives the file to the container's user. Without it the backend can't read the file.
 It then refuses to start rather than start empty, and its log shows the command to run again with `-a`.
-Running games are kept only in memory, so a restart ends them. Accounts and decks stay.
 
 **Lost admin password.** Start the backend once with `--setup` and use the new code:
 
@@ -286,7 +343,7 @@ docker compose run --rm --service-ports backend --setup
 ```
 
 1. The output shows a new `BEÁLLÍTÓKÓD`.
-2. Open `http://SERVER-IP:8787/admin`, then enter the code, your admin **name** and a new password.
+2. Open the control panel (step 4), then enter the code, your admin **name** and a new password.
 3. Press Ctrl+C, then run `docker compose up -d`.
 
 **Where the data is on disk:** `docker volume inspect mana-chess-data` shows the folder (normally
@@ -294,10 +351,13 @@ docker compose run --rm --service-ports backend --setup
 
 ---
 
-## 7. Security checklist
+## 8. Security checklist
 
 What the setup already does:
 
+- **The control panel is apart.** It has its own port (5555), published on the server's `127.0.0.1`
+  only, and it accepts only admin accounts. The backend's port, the one on the internet, has no admin
+  functions at all.
 - **No root.** Both containers run as user 65532.
 - **Distroless images.** No shell and no package manager inside, which leaves an attacker little to work
   with.
@@ -308,7 +368,8 @@ What the setup already does:
   - Limits on memory, CPU and the number of processes.
   - Log rotation (3 × 10 MB).
 - **Accounts.**
-  - Passwords are hashed with scrypt; session tokens are stored only as hashes.
+  - Passwords are hashed with scrypt; nobody can read them back, not even an admin. Session tokens are
+    stored only as hashes.
   - The data file is readable by its owner only.
 - **Built-in fail2ban.** 5 wrong passwords lock the account for 10 minutes. 10 failures from one address
   ban it for 10 minutes. The limits can be changed in the control panel.
@@ -321,13 +382,12 @@ What you should do:
       step 5.
 - [ ] Use a long admin password. Keep registration on **with approval**, and turn **guest play off** if the
       server is on the internet (Beállítások tab).
-- [ ] Optionally keep `/admin` off the internet (step 5).
-- [ ] Update regularly: `docker compose pull && docker compose up -d`.
-- [ ] Back up the data file (step 6).
+- [ ] Never publish port 5555 anywhere else, and never make an NPM proxy host or a Tailscale funnel for it.
+- [ ] Update regularly (step 6), and back up the data file (step 7).
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -335,13 +395,16 @@ What you should do:
 | … says *manifest unknown* or *not found* | The image doesn't exist yet: check the **Actions** tab of both repositories (step 1.2). |
 | … says *no matching manifest for linux/arm/v7* | 32-bit ARM isn't supported. Use a 64-bit OS (amd64 or arm64). |
 | `curl` says *404* | The backend repository is private or has another name. Paste the file by hand instead (step 3). |
-| `port is already allocated` | Something else uses 8787 or 8080. Change the **left** number of the port line, e.g. `"9787:8787"`, then use that port in the addresses. |
-| The backend keeps restarting; its log says `Az adatfájl megvan, de nem olvasható` | A restored file without `-a`. Do the restore again, with `docker compose cp -a` (step 6). |
+| `port is already allocated` | Something else uses 4545 or 5454. Change the **left** number of the port line, e.g. `"4546:4545"`, then use that port in the addresses. |
+| The SSH tunnel says *address already in use* | Port 5555 is taken on your PC: use `ssh -L 15555:127.0.0.1:5555 …` and open `http://localhost:15555`. |
+| The control panel doesn't open | It isn't on the backend's port any more: use port 5555 through SSH or Tailscale (step 4). Check that `docker-compose.yml` has the line `"127.0.0.1:5555:5555"`. |
+| After updating from the first version, `http://SERVER-IP:4545` doesn't open and the backend doesn't answer | The old `docker-compose.yml` still points to ports 8080 and 8787 inside the containers. Fetch the new file (step 6, point 3), then `docker compose up -d`. Nothing is lost. |
+| The backend keeps restarting; its log says `Az adatfájl megvan, de nem olvasható` | A restored file without `-a`. Do the restore again, with `docker compose cp -a` (step 7). |
 | The backend keeps restarting; its log says `Az adatmappa nem írható` | Only happens if you replaced the volume with a folder (`./data:/data`): `sudo chown -R 65532:65532 ./data` |
 | NPM shows *502 Bad Gateway* | The Forward Hostname must be `SERVER-IP`, not `localhost`. With the NPM-NETWORK setup: the network name must be right, and `docker inspect mana-chess-backend --format '{{json .NetworkSettings.Networks}}'` must list it. |
 | `network npm_default declared as external, but could not be found` | Wrong network name after `name:`; check `docker network ls`. |
 | The game says it can't reach the server | Open the address in a browser: `https://sakk-api.example.com/api/info` must show a short JSON. On an https page only an https backend works. |
-| The game says the versions don't match | The backend and the game page come from different releases. Update both: `docker compose pull && docker compose up -d`. |
+| The game says the versions don't match | The backend and the game page come from different releases. Update both (step 6). |
 | The Actions run is red | Open it and read the failed step's log. The image is only built when the tests pass. |
 
 **Uninstall:** `docker compose down --rmi all`, then `docker volume rm mana-chess-data` (this deletes

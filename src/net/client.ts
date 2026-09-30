@@ -5,11 +5,11 @@
 import {
   BUILD_ID, DEFAULT_PORT, POLL_WAIT_MS,
   type AccountEvent, type ActionRequest, type ColorChoice, type CreateRequest, type DeckRecord, type DrawAnswer, type JoinRequest, type MeView,
-  type NetEvent, type Ok, type PollResponse, type RoomState, type RoomSummary, type Seat, type ServerInfo, type UserBrief,
+  type NetEvent, type Ok, type PickRequest, type PollResponse, type RoomState, type RoomSummary, type Seat, type ServerInfo, type UserBrief,
 } from './protocol';
 import type { SpellId } from '../engine';
 
-/** "192.168.1.23", "192.168.1.23:8787" or a full URL → the server's origin; null if unusable. */
+/** "192.168.1.23", "192.168.1.23:5454" or a full URL → the server's origin; null if unusable. */
 export function normalizeServer(input: string): string | null {
   const raw = input.trim();
   if (!raw) return null;
@@ -227,6 +227,10 @@ export class OnlineSession {
   rematch(): Promise<Ok> {
     return this.post('rematch', {});
   }
+  /** Spell-toborzás: take a spell from the table. */
+  pick(req: Omit<PickRequest, 'token'>): Promise<Ok> {
+    return this.post('pick', req);
+  }
   leave(): Promise<Ok> {
     return this.post('leave', {});
   }
@@ -267,8 +271,8 @@ export class AccountApi {
   decline = (id: string) => this.post('/api/friends/decline', { id });
   cancelRequest = (id: string) => this.post('/api/friends/cancel', { id });
   unfriend = (id: string) => this.post('/api/friends/remove', { id });
-  challenge = (to: string, deck: SpellId[], deckName: string, color: ColorChoice, autoEndTurn: boolean) =>
-    this.post('/api/challenges/send', { to, deck, deckName, color, autoEndTurn, build: BUILD_ID });
+  challenge = (to: string, deck: SpellId[], deckName: string, color: ColorChoice, autoEndTurn: boolean, draft = false) =>
+    this.post('/api/challenges/send', { to, deck, deckName, color, autoEndTurn, draft, build: BUILD_ID });
   acceptChallenge = (id: string, deck: SpellId[], deckName: string) =>
     this.post<{ seat: Seat; state: RoomState }>('/api/challenges/accept', { id, deck, deckName, build: BUILD_ID });
   declineChallenge = (id: string) => this.post('/api/challenges/decline', { id });

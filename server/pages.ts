@@ -1,4 +1,5 @@
-// The backend's two pages: a short "what is this" at `/`, and the control panel at `/admin`.
+// The backend's two pages: a short "what is this" at `/` of the backend, and the control panel
+// (served only on the control panel's own port).
 import type { ServerInfo } from '../src/net/protocol';
 import { adminApp } from './adminApp';
 
@@ -86,6 +87,5 @@ export function landingPage(nonce: string, info: ServerInfo): string {
 <p>Ez a játék háttérszervere (backend): itt vannak a fiókok, a paklik, a barátok és a szobák. A játékot a játékoldal címén (frontend) vagy a <b>mana-chess.html</b> fájllal nyisd meg, és az <b>Online</b> résznél add meg ennek a szervernek a címét:</p>
 <span class="addr mono" id="here"></span>
 <p class="hint">Regisztráció: ${info.registration === 'open' ? 'nyitott' : info.registration === 'approval' ? 'jóváhagyással' : 'zárva'} · Vendégjáték: ${info.guests ? 'engedélyezve' : 'tiltva'}</p>
-<p style="margin-top:18px"><a href="/admin">Vezérlőpult (adminisztrátoroknak) →</a></p>
 </section></main><script nonce="${nonce}">document.getElementById('here').textContent = location.origin;</script></body></html>`;
 }

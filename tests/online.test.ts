@@ -1,10 +1,10 @@
 // Online play: the protocol helpers, the server's rooms (authority, draws, rematches, leaving,
 // presence) and a real HTTP round trip with two clients.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { applyAction, SPELL_LIST } from '../src/engine';
+import { applyAction, pickBlockReason, SPELL_LIST } from '../src/engine';
 import type { Action, SpellId } from '../src/engine';
 import { normalizeServer, OnlineSession } from '../src/net/client';
-import { BUILD_ID, colorOf, replay, setupGame, stateHash, type NetEvent, type RoomState, type Setup } from '../src/net/protocol';
+import { BUILD_ID, colorOf, DEFAULT_PORT, replay, setupGame, stateHash, type NetEvent, type RoomState, type Setup } from '../src/net/protocol';
 import { startBackend, type RunningBackend } from '../server/index';
 import { Lobby, OFFLINE_AFTER_MS } from '../server/lobby';
 import { S } from './helpers';
@@ -48,7 +48,7 @@ describe('protocol', () => {
     expect(colorOf('host', 'w')).toBe('w');
     expect(colorOf('guest', 'w')).toBe('b');
     expect(colorOf('guest', 'b')).toBe('w');
-    expect(normalizeServer('192.168.1.23')).toBe('http://192.168.1.23:8787');
+    expect(normalizeServer('192.168.1.23')).toBe(`http://192.168.1.23:${DEFAULT_PORT}`);
     expect(normalizeServer('192.168.1.23:9000')).toBe('http://192.168.1.23:9000');
     expect(normalizeServer('https://mana.example.org')).toBe('https://mana.example.org');
     expect(normalizeServer('')).toBeNull();
@@ -174,6 +174,103 @@ describe('server rooms', () => {
   });
 });
 
+describe('Spell-toborzás rooms', () => {
+  const draftTable = (extra: object = {}) => {
+    const lobby = new Lobby(() => {}, () => 1_000_000);
+    const host = lobby.create(req('Anna', { draft: true, deck: [], ...extra }));
+    if (!host.ok) throw new Error(host.error);
+    return { lobby, host, code: host.seat.code };
+  };
+
+  it('the second player starts a draft, not a game; the picks alternate; the drafted decks start the game', () => {
+    const { lobby, host, code } = draftTable();
+    expect(lobby.list()[0]).toMatchObject({ code, draft: true });
+    const guest = lobby.join(code, req('Bence', { deck: ['nem', 'pakli'] })); // a draft room ignores the deck
+    if (!guest.ok) throw new Error(guest.error);
+    const st = guest.state;
+    expect(st).toMatchObject({ game: 1, draftMode: true, setup: null, hostColor: 'w' });
+    expect(st.draft!.pool).toHaveLength(32);
+    const tok = { host: host.seat.token, guest: guest.seat.token };
+    const colorTok = (c: 'w' | 'b') => (c === 'w' ? tok.host : tok.guest); // the host plays Világos (req: color w)
+    expect(lobby.act(code, { token: tok.host, game: 1, n: 0, action: { type: 'END_TURN' }, nonce: 'x' })).toMatchObject({ ok: false });
+    let draft = st.draft!;
+    // Sötét may not start; Világos takes the first card
+    expect(lobby.pick(code, { token: tok.guest, game: 1, spell: draft.pool[0] })).toMatchObject({ ok: false, stale: true });
+    const taken: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      const who: 'w' | 'b' = i % 2 === 0 ? 'w' : 'b';
+      const id = draft.pool.find((s) => !taken.includes(s) && pickBlockReason(draft, who, s) === null)!;
+      expect(lobby.pick(code, { token: colorTok(who), game: 1, spell: id })).toEqual({ ok: true });
+      taken.push(id);
+      const now = lobby.state(code, tok.host);
+      if (!now.ok) throw new Error(now.error);
+      if (i < 11) {
+        draft = now.state.draft!;
+        // a card already taken is refused
+        expect(lobby.pick(code, { token: colorTok(who === 'w' ? 'b' : 'w'), game: 1, spell: id })).toMatchObject({ ok: false });
+      } else {
+        expect(now.state.draft).toBeNull();
+        expect(now.state.setup!.decks.w).toEqual(taken.filter((_, k) => k % 2 === 0));
+        expect(now.state.setup!.decks.b).toEqual(taken.filter((_, k) => k % 2 === 1));
+        expect(now.state.setup!.deckNames).toEqual({ w: 'Toborzott pakli', b: 'Toborzott pakli' });
+      }
+    }
+    const ev = lobby.events(code, tok.guest, 0);
+    if (!ev.ok) throw new Error(ev.error);
+    const types = ev.events.map((e) => e.type);
+    expect(types.filter((t) => t === 'pick')).toHaveLength(12);
+    expect(types.indexOf('draft')).toBeLessThan(types.indexOf('pick'));
+    expect(types[types.length - 1]).toBe('start');
+    expect(ev.events.find((e) => e.type === 'start')).toMatchObject({ game: 1 });
+    // the game is on
+    expect(lobby.act(code, { token: tok.host, game: 1, n: 0, action: mv('e2', 'e4'), nonce: 'a' })).toEqual({ ok: true, n: 0 });
+  });
+
+  it('a stale pick, a spell not on the table, a stranger', () => {
+    const { lobby, host, code } = draftTable();
+    const guest = lobby.join(code, req('Bence'));
+    if (!guest.ok) throw new Error(guest.error);
+    const d = guest.state.draft!;
+    expect(lobby.pick(code, { token: host.seat.token, game: 2, spell: d.pool[0] })).toMatchObject({ ok: false, stale: true });
+    const outside = SPELL_LIST.map((s) => s.id).find((id) => !d.pool.includes(id))!;
+    expect(lobby.pick(code, { token: host.seat.token, game: 1, spell: outside })).toMatchObject({ ok: false });
+    expect(lobby.pick(code, { token: host.seat.token, game: 1, spell: 'nincsilyen' })).toMatchObject({ ok: false });
+    expect(lobby.pick(code, { token: 'idegen', game: 1, spell: d.pool[0] })).toMatchObject({ ok: false });
+  });
+
+  it('a rematch drafts again, with a new table and the colours swapped', () => {
+    const { lobby, host, code } = draftTable();
+    const guest = lobby.join(code, req('Bence'));
+    if (!guest.ok) throw new Error(guest.error);
+    const first = guest.state.draft!;
+    let d = first;
+    for (let i = 0; i < 12; i++) {
+      const who: 'w' | 'b' = i % 2 === 0 ? 'w' : 'b';
+      const id = d.pool.find((s) => pickBlockReason(d, who, s) === null)!;
+      expect(lobby.pick(code, { token: who === 'w' ? host.seat.token : guest.seat.token, game: 1, spell: id }).ok).toBe(true);
+      const st = lobby.state(code, host.seat.token);
+      if (st.ok && st.state.draft) d = st.state.draft;
+    }
+    expect(lobby.act(code, { token: host.seat.token, game: 1, n: 0, action: { type: 'RESIGN', color: 'w' }, nonce: 'r' }).ok).toBe(true);
+    lobby.rematch(code, host.seat.token);
+    lobby.rematch(code, guest.seat.token);
+    const again = lobby.state(code, guest.seat.token);
+    if (!again.ok) throw new Error(again.error);
+    expect(again.state).toMatchObject({ game: 2, hostColor: 'b', setup: null });
+    expect(again.state.draft!.pool).not.toEqual(first.pool);
+    expect(again.state.draft!.picks).toEqual({ w: [], b: [] });
+  });
+
+  it('leaving during the draft closes the room', () => {
+    const { lobby, host, code } = draftTable();
+    const guest = lobby.join(code, req('Bence'));
+    if (!guest.ok) throw new Error(guest.error);
+    expect(lobby.leave(code, guest.seat.token)).toEqual({ ok: true });
+    const st = lobby.state(code, host.seat.token);
+    expect(st.ok && st.state.closed).toMatch(/kilépett/);
+  });
+});
+
 describe('server over HTTP', () => {
   let srv: RunningBackend;
   let base = '';
@@ -250,6 +347,36 @@ describe('server over HTTP', () => {
     await until(() => hostEvents.some((e) => e.type === 'closed'));
     hostSession.stop();
     guestSession.stop();
+  });
+
+  it('Spell-toborzás over the wire: the draft, the picks and the game that follows', async () => {
+    const created = await post('/api/rooms', req('Anna', { draft: true, color: 'b' }));
+    expect(created.ok).toBe(true);
+    const listed = await (await fetch(`${base}/api/rooms`)).json();
+    expect(listed.rooms.find((r: { code: string }) => r.code === created.seat.code)).toMatchObject({ draft: true });
+    const joined = await post(`/api/rooms/${created.seat.code}/join`, req('Bence'));
+    expect(joined.ok).toBe(true);
+    const st = joined.state as RoomState;
+    expect(st.draft!.pool).toHaveLength(32);
+    const host = new OnlineSession(base, created.seat, created.state as RoomState);
+    const guest = new OnlineSession(base, joined.seat, st);
+    // Anna (host) plays Sötét: Bence (Világos) picks first
+    let d = st.draft!;
+    for (let i = 0; i < 12; i++) {
+      const who: 'w' | 'b' = i % 2 === 0 ? 'w' : 'b';
+      const id = d.pool.find((s) => pickBlockReason(d, who, s) === null)!;
+      const s = who === 'w' ? guest : host;
+      expect(await s.pick({ game: 1, spell: id })).toEqual({ ok: true });
+      const now = await s.state();
+      if (now.ok && now.state.draft) d = now.state.draft;
+      else if (now.ok) {
+        expect(now.state.setup!.decks.w).toHaveLength(6);
+        expect(now.state.setup!.names).toEqual({ w: 'Bence', b: 'Anna' });
+      }
+    }
+    const fin = await host.state();
+    expect(fin.ok && fin.state.setup && fin.state.draft === null).toBe(true);
+    await guest.leave();
   });
 
   it('a room code that does not exist', async () => {

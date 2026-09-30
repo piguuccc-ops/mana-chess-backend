@@ -5,10 +5,12 @@
 // A room has two seats (host and guest). When the guest sits down the game starts; the server
 // keeps the real game state, accepts an action only from the player whose turn it is and puts
 // every accepted action into the room's event stream, which both players poll.
+// In a Spell-toborzás room every game begins with a draft: the two take spells from a table of 32
+// in turn (the server checks every pick), and the game starts with the drafted decks.
 // ─────────────────────────────────────────────────────────────────────────────
 import { randomInt, randomUUID } from 'node:crypto';
-import { applyAction, opposite, SPELLS, validateDeck } from '../src/engine';
-import type { Action, Color, GameState, PromotionPiece, SpellId } from '../src/engine';
+import { applyAction, applyPick, draftDone, newDraft, opposite, pickBlockReason, SPELLS, validateDeck } from '../src/engine';
+import type { Action, Color, Draft, GameState, PromotionPiece, SpellId } from '../src/engine';
 import {
   BUILD_ID, colorOf, DECK_NAME_MAX, NAME_MAX, setupGame, stateHash,
   type ColorChoice, type DrawAnswer, type MyGame, type NetEvent, type Ok, type Role, type RoomState, type RoomSummary, type Seat, type Setup,
@@ -50,6 +52,10 @@ interface Room {
   touchedAt: number;
   hostChoice: ColorChoice;
   autoEndTurn: boolean;
+  /** Spell-toborzás: every game begins with a draft. */
+  draftMode: boolean;
+  /** The running draft (between the two players sitting down and the game starting). */
+  draft: Draft | null;
   players: Record<Role, Player | null>;
   game: number;
   setup: Setup | null;
@@ -144,6 +150,7 @@ export class Lobby {
         guest: !r.players.host!.userId,
         hostColor: r.hostChoice,
         autoEndTurn: r.autoEndTurn,
+        draft: r.draftMode,
         age: Math.round((t - r.createdAt) / 1000),
       }));
   }
@@ -158,11 +165,13 @@ export class Lobby {
     if (!sameBuild(body.build)) return fail(versionError(body.build));
     if (!member && !this.guestsAllowed()) return fail(GUESTS_OFF);
     if (this.openRooms >= MAX_ROOMS) return fail('A szerver tele van – próbáld később.');
-    const deck = cleanDeck(body.deck);
+    const draftMode = body.draft === true;
+    // in a Spell-toborzás room the decks are drafted: the players' own decks are not used
+    const deck = draftMode ? [] : cleanDeck(body.deck);
     if (typeof deck === 'string') return fail(deck);
     const choice: ColorChoice = body.color === 'w' || body.color === 'b' ? body.color : 'random';
-    const room = this.newRoom(choice, body.autoEndTurn !== false, this.newPlayer(body, deck, 'Házigazda', member));
-    this.log(`Új szoba: ${room.code} (${room.players.host!.name})`);
+    const room = this.newRoom(choice, body.autoEndTurn !== false, this.newPlayer(body, deck, 'Házigazda', member), draftMode);
+    this.log(`Új szoba: ${room.code} (${room.players.host!.name}${draftMode ? ', spell-toborzás' : ''})`);
     this.membersChanged(room);
     return { ok: true, seat: { code: room.code, token: room.players.host!.token, role: 'host' }, state: this.view(room, 'host') };
   }
@@ -175,7 +184,7 @@ export class Lobby {
     if (!member && !this.guestsAllowed()) return fail(GUESTS_OFF);
     if (room.players.guest) return fail('Ez a szoba már megtelt.');
     if (member && room.players.host?.userId === member.id) return fail('Ez a saját szobád – várd meg, hogy valaki belépjen.');
-    const deck = cleanDeck(body.deck);
+    const deck = room.draftMode ? [] : cleanDeck(body.deck);
     if (typeof deck === 'string') return fail(deck);
     room.players.guest = this.newPlayer(body, deck, 'Vendég', member);
     this.log(`${room.players.guest.name} csatlakozott: ${room.code}`);
@@ -192,9 +201,10 @@ export class Lobby {
     guest: { member: Member; deck: SpellId[]; deckName: string },
     choice: ColorChoice,
     autoEndTurn: boolean,
+    draftMode = false,
   ): { host: { seat: Seat; state: RoomState }; guest: { seat: Seat; state: RoomState } } {
     const make = (p: typeof host, fallback: string) => this.newPlayer({ deckName: p.deckName }, p.deck, fallback, p.member);
-    const room = this.newRoom(choice, autoEndTurn, make(host, 'Kihívó'));
+    const room = this.newRoom(choice, autoEndTurn, make(host, 'Kihívó'), draftMode);
     room.players.guest = make(guest, 'Kihívott');
     this.startGame(room, choice === 'random' ? (randomInt(2) ? 'w' : 'b') : choice);
     this.log(`Kihívás elfogadva: ${host.member.name} – ${guest.member.name} (${room.code})`);
@@ -213,7 +223,7 @@ export class Lobby {
         const p = room.players[role];
         if (p?.userId !== userId) continue;
         const other = room.players[role === 'host' ? 'guest' : 'host'];
-        out.push({ code: room.code, token: p.token, role, opponent: other?.name ?? null, game: room.game, running: !!room.state && room.state.status.kind === 'playing' });
+        out.push({ code: room.code, token: p.token, role, opponent: other?.name ?? null, game: room.game, running: this.running(room) });
       }
     }
     return out;
@@ -222,7 +232,7 @@ export class Lobby {
   /** An account is at a board right now (a running game, connected). */
   isPlaying(userId: string): boolean {
     for (const room of this.rooms.values()) {
-      if (room.closed || !room.state || room.state.status.kind !== 'playing') continue;
+      if (room.closed || !this.running(room)) continue;
       for (const role of ['host', 'guest'] as const) {
         const p = room.players[role];
         if (p?.userId === userId && this.isOnline(p)) return true;
@@ -240,7 +250,7 @@ export class Lobby {
         code: r.code,
         host: r.players.host?.name ?? '?',
         guest: r.players.guest?.name ?? null,
-        running: !!r.state && r.state.status.kind === 'playing',
+        running: this.running(r),
         game: r.game,
         age: Math.round((t - r.createdAt) / 1000),
       }));
@@ -335,6 +345,26 @@ export class Lobby {
     return { ok: true };
   }
 
+  /** Spell-toborzás: the player whose turn it is takes one spell from the table. */
+  pick(code: string, body: unknown): Ok {
+    if (!isObj(body) || typeof body.token !== 'string') return fail('Érvénytelen kérés.');
+    const found = this.find(code, body.token);
+    if (typeof found === 'string') return fail(found);
+    const { room, role } = found;
+    this.seen(room, role);
+    if (room.closed) return fail('A szoba bezárult.');
+    if (!room.draft || !room.hostColor) return fail('Most nincs toborzás.');
+    if (body.game !== room.game) return fail('A toborzás közben továbbhaladt.', { stale: true });
+    if (!hasSpell(body.spell)) return fail('Ismeretlen spell.');
+    const me = colorOf(role, room.hostColor);
+    const why = pickBlockReason(room.draft, me, body.spell);
+    if (why) return fail(why, { stale: why === 'Most nem te választasz.' });
+    room.draft = applyPick(room.draft, me, body.spell);
+    this.push(room, { type: 'pick', game: room.game, by: me, spell: body.spell });
+    if (draftDone(room.draft)) this.launch(room, room.draft.picks, { w: DRAFTED_DECK, b: DRAFTED_DECK });
+    return { ok: true };
+  }
+
   /** After a game: both players ask for a rematch → a new game with the colours swapped. */
   rematch(code: string, token: string): Ok {
     const found = this.find(code, token);
@@ -396,7 +426,7 @@ export class Lobby {
     }
   }
 
-  private newRoom(choice: ColorChoice, autoEndTurn: boolean, host: Player): Room {
+  private newRoom(choice: ColorChoice, autoEndTurn: boolean, host: Player, draftMode = false): Room {
     const t = this.now();
     const room: Room = {
       code: this.newCode(),
@@ -404,6 +434,8 @@ export class Lobby {
       touchedAt: t,
       hostChoice: choice,
       autoEndTurn,
+      draftMode,
+      draft: null,
       players: { host, guest: null },
       game: 0,
       setup: null,
@@ -458,26 +490,50 @@ export class Lobby {
     }
   }
 
+  /** A new game in the room: at once with the players' decks, or after a draft (Spell-toborzás). */
   private startGame(room: Room, hostColor: Color): void {
     const host = room.players.host!;
     const guest = room.players.guest!;
     const by = (c: Color) => (c === hostColor ? host : guest);
     room.game += 1;
     room.hostColor = hostColor;
+    room.state = null;
+    room.setup = null;
+    room.actions = [];
+    room.drawOffer = null;
+    room.rematch.clear();
+    if (room.draftMode) {
+      room.draft = newDraft(randomInt(2 ** 31));
+      this.push(room, { type: 'draft', game: room.game, draft: room.draft, hostColor, names: { w: by('w').name, b: by('b').name } });
+      this.log(`Spell-toborzás indul (${room.code}, ${room.game}.): Világos ${by('w').name}, Sötét ${by('b').name}`);
+      this.membersChanged(room);
+      return;
+    }
+    this.launch(room, { w: [...by('w').deck], b: [...by('b').deck] }, { w: by('w').deckName, b: by('b').deckName });
+  }
+
+  /** The game itself begins (game number `room.game`). */
+  private launch(room: Room, decks: Record<Color, SpellId[]>, deckNames: Record<Color, string>): void {
+    const hostColor = room.hostColor!;
+    const by = (c: Color) => (c === hostColor ? room.players.host! : room.players.guest!);
     room.setup = {
-      decks: { w: [...by('w').deck], b: [...by('b').deck] },
-      deckNames: { w: by('w').deckName, b: by('b').deckName },
+      decks: { w: [...decks.w], b: [...decks.b] },
+      deckNames: { ...deckNames },
       names: { w: by('w').name, b: by('b').name },
       seed: randomInt(2 ** 31),
       autoEndTurn: room.autoEndTurn,
     };
+    room.draft = null;
     room.state = setupGame(room.setup);
     room.actions = [];
-    room.drawOffer = null;
-    room.rematch.clear();
     this.push(room, { type: 'start', game: room.game, setup: room.setup, hostColor });
     this.log(`Játszma indul (${room.code}, ${room.game}.): Világos ${room.setup.names.w}, Sötét ${room.setup.names.b}`);
     this.membersChanged(room);
+  }
+
+  /** Being drafted or played (not waiting, not over). */
+  private running(room: Room): boolean {
+    return !!room.draft || (!!room.state && room.state.status.kind === 'playing');
   }
 
   private membersChanged(room: Room): void {
@@ -530,6 +586,8 @@ export class Lobby {
       role,
       names: { host: room.players.host?.name ?? null, guest: room.players.guest?.name ?? null },
       game: room.game,
+      draftMode: room.draftMode,
+      draft: room.draft,
       setup: room.setup,
       hostColor: room.hostColor,
       actions: [...room.actions],
@@ -545,6 +603,8 @@ export class Lobby {
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 
 const GUESTS_OFF = 'Ezen a szerveren csak bejelentkezve lehet játszani.';
+/** The name a drafted deck plays under. */
+export const DRAFTED_DECK = 'Toborzott pakli';
 
 /** Page and server must run the same rules (a development build on either side is let through). */
 export const sameBuild = (build: unknown): boolean => BUILD_ID === 'dev' || build === 'dev' || build === BUILD_ID;

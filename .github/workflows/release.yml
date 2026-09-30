@@ -28,6 +28,7 @@ jobs:
         run: |
           mkdir -p out/mana-chess-backend
           cp dist/backend.mjs release/Start.bat release/start.sh release/README.txt out/mana-chess-backend/
+          cp LICENSE out/mana-chess-backend/LICENSE.txt
           chmod +x out/mana-chess-backend/start.sh
           (cd out && zip -r "../mana-chess-backend-${GITHUB_REF_NAME}.zip" mana-chess-backend)
       - name: GitHub release

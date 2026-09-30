@@ -321,7 +321,7 @@ export function adminApp(): void {
           h('dt', null, 'Fut'),
           h('dd', null, dur(s.uptime)),
           h('dt', null, 'Cím a játékhoz'),
-          h('dd', { class: 'mono' }, (d.addresses as string[]).join('  ·  ') || 'nincs megadva – Dockerben: BACKEND_PUBLIC_URL / MANA_PUBLIC_URL'),
+          h('dd', { class: 'mono' }, (d.addresses as string[]).join('  ·  ') || 'nincs megadva – Dockerben: MANA_PUBLIC_URL a docker-compose.yml-ben'),
         ),
         h(
           'p',

@@ -15,13 +15,15 @@
 // through routers, proxies and virus scanners, and a page opened straight from a file can use it.
 // ─────────────────────────────────────────────────────────────────────────────
 import { applyAction, createGame } from '../engine';
-import type { Action, Color, GameState, SpellId } from '../engine';
+import type { Action, Color, Draft, GameState, SpellId } from '../engine';
 
 declare const __BUILD_ID__: string | undefined;
 /** Identifies the rules: server and page must run the same engine (set at build time). */
 export const BUILD_ID: string = typeof __BUILD_ID__ === 'string' ? __BUILD_ID__ : 'dev';
 
-export const DEFAULT_PORT = 8787;
+/** The backend's port (players), and the control panel's (the server's own machine – or a private network such as Tailscale). */
+export const DEFAULT_PORT = 5454;
+export const ADMIN_PORT = 5555;
 export const NAME_MAX = 20;
 export const DECK_NAME_MAX = 32;
 /** How long the server keeps a poll open when nothing happens (ms). */
@@ -106,6 +108,8 @@ export interface RoomSummary {
   guest: boolean;
   hostColor: ColorChoice;
   autoEndTurn: boolean;
+  /** Spell-toborzás: the decks are drafted from a table of 32 spells once both are in. */
+  draft: boolean;
   /** Seconds since the room was opened. */
   age: number;
 }
@@ -117,6 +121,8 @@ export interface CreateRequest {
   deckName: string;
   color: ColorChoice;
   autoEndTurn: boolean;
+  /** Spell-toborzás instead of the players' own decks (then `deck` is not used). */
+  draft?: boolean;
   build: string;
   /** Account session, when signed in. */
   auth?: string;
@@ -144,6 +150,10 @@ export interface RoomState {
   names: Record<Role, string | null>;
   /** 0 = waiting for the second player. */
   game: number;
+  /** Spell-toborzás room: every game starts with a draft. */
+  draftMode: boolean;
+  /** The draft of game `game` while it lasts (then `setup` takes over). */
+  draft: Draft | null;
   setup: Setup | null;
   hostColor: Color | null;
   actions: Action[];
@@ -156,6 +166,8 @@ export interface RoomState {
 }
 
 export type NetEvent =
+  | { id: number; type: 'draft'; game: number; draft: Draft; hostColor: Color; names: Record<Color, string> }
+  | { id: number; type: 'pick'; game: number; by: Color; spell: SpellId }
   | { id: number; type: 'start'; game: number; setup: Setup; hostColor: Color }
   | { id: number; type: 'action'; game: number; n: number; action: Action; by: Color; hash: string; nonce?: string }
   | { id: number; type: 'drawOffer'; game: number; by: Color }
@@ -180,6 +192,13 @@ export interface ActionRequest {
 }
 
 export type DrawAnswer = 'offer' | 'accept' | 'decline';
+
+/** Spell-toborzás: taking one spell from the table. */
+export interface PickRequest {
+  token: string;
+  game: number;
+  spell: SpellId;
+}
 
 export type Ok<T = object> = ({ ok: true } & T) | { ok: false; error: string; stale?: boolean };
 
@@ -220,6 +239,8 @@ export interface ChallengeView {
   /** The colour the challenger asked for. */
   color: ColorChoice;
   autoEndTurn: boolean;
+  /** Spell-toborzás: the decks are drafted at the start. */
+  draft: boolean;
   deckName: string;
   createdAt: number;
   expiresAt: number;
@@ -232,7 +253,7 @@ export interface MyGame {
   role: Role;
   opponent: string | null;
   game: number;
-  /** The game is being played (not waiting, not over). */
+  /** The game is being played or drafted (not waiting, not over). */
   running: boolean;
 }
 

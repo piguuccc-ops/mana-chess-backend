@@ -19,7 +19,7 @@ await build({
   legalComments: 'none',
   logLevel: 'warning',
   define: { __BUILD_ID__: JSON.stringify(id) },
-  banner: { js: `// Mana Chess backend (verzió: ${id}). Indítás: node backend.mjs – lásd README.` },
+  banner: { js: `// Mana Chess backend (verzió: ${id}). MIT License, (c) 2026 piguuccc-ops – see LICENSE. Indítás: node backend.mjs – lásd README.` },
 });
 copyFileSync('docker/healthcheck.mjs', 'dist/healthcheck.mjs');
 console.log(`dist/backend.mjs – verzió (a játékszabályok ujjlenyomata): ${id}`);

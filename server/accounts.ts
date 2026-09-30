@@ -64,6 +64,8 @@ interface Challenge {
   deckName: string;
   color: ColorChoice;
   autoEndTurn: boolean;
+  /** Spell-toborzás: the decks are drafted at the start (`deck` is not used). */
+  draft: boolean;
   createdAt: number;
   expiresAt: number;
 }
@@ -479,6 +481,7 @@ export class Accounts {
     to: this.brief(this.byId(c.to)!),
     color: c.color,
     autoEndTurn: c.autoEndTurn,
+    draft: c.draft,
     deckName: c.deckName,
     createdAt: c.createdAt,
     expiresAt: c.expiresAt,
@@ -490,7 +493,8 @@ export class Accounts {
     const friend = this.byId(body.to);
     if (!friend || !user.friends.includes(friend.id)) return fail('Csak a barátaidat hívhatod ki.');
     if (this.presenceOf(friend.id) === 'offline') return fail(`${friend.name} most nincs bejelentkezve.`);
-    const deck = cleanDeck(body.deck);
+    const draft = body.draft === true;
+    const deck = draft ? [] : cleanDeck(body.deck);
     if (typeof deck === 'string') return fail(deck);
     // one standing challenge per friend: a new one replaces the old
     for (const c of [...this.challenges.values()]) if (c.from === user.id && c.to === friend.id) this.challenges.delete(c.id);
@@ -504,11 +508,12 @@ export class Accounts {
       deckName: cleanText(body.deckName, 32, 'Pakli'),
       color: body.color === 'w' || body.color === 'b' ? body.color : 'random',
       autoEndTurn: body.autoEndTurn !== false,
+      draft,
       createdAt: t,
       expiresAt: t + CHALLENGE_MS,
     };
     this.challenges.set(c.id, c);
-    this.push(friend.id, { type: 'refresh', notice: `${user.name} kihívott egy játszmára!` });
+    this.push(friend.id, { type: 'refresh', notice: `${user.name} kihívott egy ${draft ? 'spell-toborzásos ' : ''}játszmára!` });
     this.push(user.id, { type: 'refresh' });
     return { ok: true, challenge: this.challengeView(c) };
   }
@@ -523,7 +528,7 @@ export class Accounts {
       this.challenges.delete(c.id);
       return fail('A kihívó már nincs a szerveren.');
     }
-    const deck = cleanDeck(body.deck);
+    const deck = c.draft ? [] : cleanDeck(body.deck);
     if (typeof deck === 'string') return fail(deck);
     this.challenges.delete(c.id);
     const r = this.lobby.direct(
@@ -531,6 +536,7 @@ export class Accounts {
       { member: this.member(user), deck, deckName: cleanText(body.deckName, 32, 'Pakli') },
       c.color,
       c.autoEndTurn,
+      c.draft,
     );
     this.push(from.id, { type: 'game', seat: r.host.seat, state: r.host.state });
     this.push(from.id, { type: 'refresh', notice: `${user.name} elfogadta a kihívást – indul a játszma!` });
