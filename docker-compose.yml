@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Mana Chess: the backend (accounts, decks, friends, rooms, control panel) and the game page,
+# each in its own locked-down container. This one file is the whole installation:
+#
+#   mkdir -p ~/mana-chess && cd ~/mana-chess
+#   nano docker-compose.yml          paste this file, save: Ctrl+O, Enter, Ctrl+X
+#   docker compose up -d             download and start both containers
+#   docker compose logs backend      the one-time setup code (BEÁLLÍTÓKÓD) for the admin account
+#
+#   Control panel:  http://SERVER-IP:8787/admin      Game:  http://SERVER-IP:8080
+#   (SERVER-IP is this server's address on your network – `hostname -I` shows it)
+#
+#   Update:  docker compose pull && docker compose up -d
+#   Guide:   https://github.com/piguuccc-ops/mana-chess-backend/blob/main/DEPLOY.md
+# ─────────────────────────────────────────────────────────────────────────────
+name: mana-chess
+
+# the same lock-down for both containers
+x-hardened: &hardened
+  restart: unless-stopped
+  init: true                      # a tiny init as PID 1: signals and stray processes handled properly
+  user: "65532:65532"             # an unprivileged user (the images' own "nonroot"), never root
+  read_only: true                 # the container's own files cannot be changed
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  cap_drop:
+    - ALL                         # no Linux capabilities at all
+  security_opt:
+    - no-new-privileges:true      # nothing inside can gain privileges later (setuid binaries etc.)
+  pids_limit: 128
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  backend:
+    <<: *hardened
+    image: ghcr.io/piguuccc-ops/mana-chess-backend:latest
+    container_name: mana-chess-backend
+    environment:
+      TZ: Europe/Budapest
+      # The backend's address as players type it into the game (shown in the control panel).
+      # Behind Nginx Proxy Manager: "https://sakk-api.example.com". Empty is fine at home.
+      MANA_PUBLIC_URL: ""
+    volumes:
+      - data:/data                # accounts, decks, settings: the only place it can write to
+    ports:
+      - "8787:8787"               # server with a public IP (VPS)? use "127.0.0.1:8787:8787"
+    mem_limit: 256m
+    cpus: 1.0
+    # networks: [default, npm]    # NPM-NETWORK, see the end of this file
+
+  frontend:
+    <<: *hardened
+    image: ghcr.io/piguuccc-ops/mana-chess-frontend:latest
+    container_name: mana-chess-frontend
+    environment:
+      TZ: Europe/Budapest
+      # The backend the game page offers by default. Empty: port 8787 on the host the page came
+      # from (right for the home network). On the internet: "https://sakk-api.example.com"
+      MANA_BACKEND: ""
+    ports:
+      - "8080:8080"               # server with a public IP (VPS)? use "127.0.0.1:8080:8080"
+    mem_limit: 128m
+    cpus: 0.5
+    # networks: [default, npm]    # NPM-NETWORK, see the end of this file
+
+volumes:
+  data:
+    name: mana-chess-data         # survives updates and `docker compose down` (but not `down -v`!)
+
+# NPM-NETWORK (optional): Nginx Proxy Manager runs in Docker on this same server, and you want it
+# to reach the containers by name (mana-chess-backend:8787, mana-chess-frontend:8080)?
+# Remove the "# " from the two "networks:" lines above and from the four lines below, and put
+# NPM's network after "name:" (find it with: docker network ls). Then: docker compose up -d
+# networks:
+#   npm:
+#     external: true
+#     name: npm_default

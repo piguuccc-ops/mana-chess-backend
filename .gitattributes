@@ -1,0 +1,6 @@
+# line endings: Windows launchers keep CRLF, shell scripts LF, everything else as git decides
+* text=auto
+*.bat text eol=crlf
+release/*.txt text eol=crlf
+*.sh text eol=lf
+*.png binary

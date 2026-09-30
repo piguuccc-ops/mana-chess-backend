@@ -1,0 +1,26 @@
+{
+  "name": "mana-chess-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mana Chess backend: accounts, server-side decks, friends, challenges, game rooms and a web control panel",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "tsx server/main.ts --data ./data",
+    "build": "node scripts/build.mjs",
+    "start": "node dist/backend.mjs --data ./data",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "sync": "node scripts/sync-shared.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
+}

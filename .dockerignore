@@ -1,0 +1,16 @@
+# only what the image build needs goes to the Docker daemon
+.git
+.github
+node_modules
+dist
+data
+docker-compose*.yml
+release
+coverage
+*.log
+.env
+.env.*
+Dockerfile
+.dockerignore
+*.md
+tests
