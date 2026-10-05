@@ -5,7 +5,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { AccountRole, DeckRecord, RegistrationMode } from '../src/net/protocol';
+import { RATING_FLOOR, RATING_START, type AccountRole, type DeckRecord, type RankedRecord, type RegistrationMode } from '../src/net/protocol';
 
 export interface StoredUser {
   id: string;
@@ -27,6 +27,20 @@ export interface StoredUser {
   /** Wrong passwords in a row, and until when logging in is refused (fail2ban). */
   failed: number;
   lockedUntil: number;
+  /** Élő-pontszám and the ranked results (matchmade games only). Data files from before ranked play get the defaults. */
+  rating: number;
+  ranked: RankedRecord;
+}
+
+const count = (v: unknown): number => (Number.isInteger(v) && (v as number) >= 0 ? (v as number) : 0);
+
+/** A user record from the data file, with the fields added since it was written. */
+export function upgradeUser(u: StoredUser): StoredUser {
+  const raw = u as Partial<StoredUser>;
+  u.rating = typeof raw.rating === 'number' && Number.isFinite(raw.rating) ? Math.max(RATING_FLOOR, Math.round(raw.rating)) : RATING_START;
+  const r = (raw.ranked ?? {}) as Partial<RankedRecord>;
+  u.ranked = { w: count(r.w), l: count(r.l), d: count(r.d) };
+  return u;
 }
 
 export interface StoredSession {
@@ -114,7 +128,7 @@ export class Store {
         this.data = {
           version: 1,
           settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
-          users: Array.isArray(raw.users) ? raw.users : [],
+          users: Array.isArray(raw.users) ? raw.users.filter((u) => u && typeof u === 'object').map(upgradeUser) : [],
           sessions: Array.isArray(raw.sessions) ? raw.sessions : [],
           bans: Array.isArray(raw.bans) ? raw.bans : [],
         };

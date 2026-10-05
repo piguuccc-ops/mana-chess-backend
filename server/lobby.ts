@@ -7,13 +7,17 @@
 // every accepted action into the room's event stream, which both players poll.
 // In a Spell-toborzás room every game begins with a draft: the two take spells from a table of 32
 // in turn (the server checks every pick), and the game starts with the drafted decks.
+// A ranked room (two players paired by matchmaking) holds one game whose result changes both
+// players' Élő-pontszám: no rematch, leaving is a loss, and the server keeps a turn clock – three
+// minutes a turn, a minute away – so nobody can stall a lost game.
 // ─────────────────────────────────────────────────────────────────────────────
 import { randomInt, randomUUID } from 'node:crypto';
 import { applyAction, applyPick, draftDone, newDraft, opposite, pickBlockReason, SPELLS, validateDeck } from '../src/engine';
 import type { Action, Color, Draft, GameState, PromotionPiece, SpellId } from '../src/engine';
 import {
-  BUILD_ID, colorOf, DECK_NAME_MAX, NAME_MAX, setupGame, stateHash,
-  type ColorChoice, type DrawAnswer, type MyGame, type NetEvent, type Ok, type Role, type RoomState, type RoomSummary, type Seat, type Setup,
+  BUILD_ID, colorOf, DECK_NAME_MAX, NAME_MAX, RANKED_AWAY_MS, RANKED_TURN_MS, setupGame, stateHash,
+  type ColorChoice, type DrawAnswer, type ForfeitReason, type MyGame, type NetEvent, type Ok, type RatingChange, type Role, type RoomState,
+  type RoomSummary, type Seat, type Setup,
 } from '../src/net/protocol';
 
 /** A signed-in player (rooms show the account's name and keep the seat with the account). */
@@ -32,6 +36,15 @@ const HOST_GONE_MS = 90_000;
 const CLOSED_KEEP_MS = 10 * 60_000;
 /** No poll for this long (and none open): shown as disconnected. */
 export const OFFLINE_AFTER_MS = 10_000;
+/** The turn clock of a ranked game forgives this much (the page's own countdown runs a little behind the server's). */
+const TURN_GRACE_MS = 5000;
+
+/** A ranked game has ended: whose accounts played which colour, and who won (null: a draw). */
+export interface RankedResult {
+  code: string;
+  players: Record<Color, string | null>;
+  winner: Color | null;
+}
 
 interface Player {
   name: string;
@@ -69,6 +82,16 @@ interface Room {
   closed: string | null;
   closedAt: number;
   waiters: Set<() => void>;
+  /** A ranked (matchmade) game: the ratings at its start. Null: a friendly game. */
+  ranked: Record<Role, number> | null;
+  /** The ranked game's result: the new ratings, and a loss on the clock (or for being away). */
+  rated: Record<Color, RatingChange> | null;
+  forfeit: { by: Color; reason: ForfeitReason } | null;
+  /** The turn clock (ranked games): whose turn it is and since when. */
+  turnOwner: Color | null;
+  turnSince: number;
+  /** When the last presence check ran (a server-wide outage pauses the turn clock). */
+  checkedAt: number;
 }
 
 type LogFn = (msg: string) => void;
@@ -128,6 +151,8 @@ export class Lobby {
   readonly rooms = new Map<string, Room>();
   /** Accounts whose list of games changed (a room of theirs opened, started, ended or closed). */
   onMembersChanged: (userIds: string[]) => void = () => {};
+  /** A ranked game ended: the accounts' ratings are updated there; the new ones are announced in the room. */
+  onRankedOver: (r: RankedResult) => Record<Color, RatingChange> | null = () => null;
 
   constructor(
     private readonly log: LogFn = () => {},
@@ -202,12 +227,19 @@ export class Lobby {
     choice: ColorChoice,
     autoEndTurn: boolean,
     draftMode = false,
+    /** A ranked game (matchmaking): the two players' ratings now. */
+    ranked: Record<Role, number> | null = null,
   ): { host: { seat: Seat; state: RoomState }; guest: { seat: Seat; state: RoomState } } {
     const make = (p: typeof host, fallback: string) => this.newPlayer({ deckName: p.deckName }, p.deck, fallback, p.member);
     const room = this.newRoom(choice, autoEndTurn, make(host, 'Kihívó'), draftMode);
     room.players.guest = make(guest, 'Kihívott');
+    room.ranked = ranked ? { host: ranked.host, guest: ranked.guest } : null;
     this.startGame(room, choice === 'random' ? (randomInt(2) ? 'w' : 'b') : choice);
-    this.log(`Kihívás elfogadva: ${host.member.name} – ${guest.member.name} (${room.code})`);
+    this.log(
+      ranked
+        ? `Rangsorolt párosítás: ${host.member.name} (${ranked.host}) – ${guest.member.name} (${ranked.guest}), ${room.code}`
+        : `Kihívás elfogadva: ${host.member.name} – ${guest.member.name} (${room.code})`,
+    );
     return {
       host: { seat: { code: room.code, token: room.players.host!.token, role: 'host' }, state: this.view(room, 'host') },
       guest: { seat: { code: room.code, token: room.players.guest.token, role: 'guest' }, state: this.view(room, 'guest') },
@@ -223,7 +255,7 @@ export class Lobby {
         const p = room.players[role];
         if (p?.userId !== userId) continue;
         const other = room.players[role === 'host' ? 'guest' : 'host'];
-        out.push({ code: room.code, token: p.token, role, opponent: other?.name ?? null, game: room.game, running: this.running(room) });
+        out.push({ code: room.code, token: p.token, role, opponent: other?.name ?? null, game: room.game, running: this.running(room), ranked: !!room.ranked });
       }
     }
     return out;
@@ -242,7 +274,7 @@ export class Lobby {
   }
 
   /** The rooms for the control panel. */
-  overview(): { code: string; host: string; guest: string | null; running: boolean; game: number; age: number }[] {
+  overview(): { code: string; host: string; guest: string | null; running: boolean; game: number; age: number; ranked: boolean }[] {
     const t = this.now();
     return [...this.rooms.values()]
       .filter((r) => !r.closed)
@@ -253,7 +285,13 @@ export class Lobby {
         running: this.running(r),
         game: r.game,
         age: Math.round((t - r.createdAt) / 1000),
+        ranked: !!r.ranked,
       }));
+  }
+
+  /** An account has a game going on (being played or drafted) – it may not look for a ranked one meanwhile. */
+  hasRunningGame(userId: string): boolean {
+    return this.gamesOf(userId).some((g) => g.running);
   }
 
   /** An account is gone (deleted): its running games are resigned and its rooms closed. */
@@ -371,6 +409,7 @@ export class Lobby {
     if (typeof found === 'string') return fail(found);
     const { room, role } = found;
     this.seen(room, role);
+    if (room.ranked) return fail('Rangsorolt játszma után nincs visszavágó – a Rangsorolt fülön keress új ellenfelet.');
     if (room.closed) return fail('Az ellenfél már kilépett.');
     if (!room.state || room.state.status.kind === 'playing') return fail('A játszma még tart.');
     if (room.rematch.has(role)) return { ok: true };
@@ -411,10 +450,44 @@ export class Lobby {
           this.log(`${p.name} kapcsolata megszakadt (${room.code})`);
         }
       }
+      if (room.ranked) this.turnClock(room, t);
+      room.checkedAt = t;
+      if (room.closed) continue;
       const host = room.players.host!;
       if (!room.players.guest && t - host.lastSeen > HOST_GONE_MS && host.polls === 0) this.close(room, 'A házigazda elment.');
       else if (t - room.touchedAt > IDLE_ROOM_MS) this.close(room, 'A szoba sokáig tétlen volt.');
     }
+  }
+
+  /**
+   * Ranked games may not be stalled: a player away (no connection) for a minute loses, and so does
+   * the player to move after three minutes on one turn. When both are away – the server's own
+   * network, most likely – nobody loses and the turn clock waits.
+   */
+  private turnClock(room: Room, t: number): void {
+    const st = room.state;
+    if (!st || !room.hostColor || st.status.kind !== 'playing') return;
+    const away = (role: Role) => {
+      const p = room.players[role]!;
+      return p.polls === 0 && t - p.lastSeen > RANKED_AWAY_MS;
+    };
+    const gone = (['host', 'guest'] as const).filter((r) => !this.isOnline(room.players[r]!));
+    if (gone.length === 2) {
+      room.turnSince += Math.max(0, t - room.checkedAt);
+      return;
+    }
+    const lost = (['host', 'guest'] as const).find(away);
+    if (lost) return this.forfeit(room, colorOf(lost, room.hostColor), 'away');
+    const owner = st.pendingPromotion?.color ?? st.turn;
+    if (t - room.turnSince > RANKED_TURN_MS + TURN_GRACE_MS) this.forfeit(room, owner, 'time');
+  }
+
+  private forfeit(room: Room, color: Color, reason: ForfeitReason): void {
+    const p = room.players[room.hostColor === color ? 'host' : 'guest']!;
+    room.forfeit = { by: color, reason };
+    this.push(room, { type: 'forfeit', game: room.game, by: color, reason });
+    this.log(`${p.name} elvesztette a rangsorolt játszmát: ${reason === 'time' ? 'lejárt a lépésideje' : 'túl sokáig nem volt kapcsolata'} (${room.code})`);
+    this.apply(room, { type: 'RESIGN', color }, color);
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
@@ -449,6 +522,12 @@ export class Lobby {
       closed: null,
       closedAt: 0,
       waiters: new Set(),
+      ranked: null,
+      rated: null,
+      forfeit: null,
+      turnOwner: null,
+      turnSince: t,
+      checkedAt: t,
     };
     this.rooms.set(room.code, room);
     return room;
@@ -526,6 +605,8 @@ export class Lobby {
     room.draft = null;
     room.state = setupGame(room.setup);
     room.actions = [];
+    room.turnOwner = room.state.turn;
+    room.turnSince = this.now();
     this.push(room, { type: 'start', game: room.game, setup: room.setup, hostColor });
     this.log(`Játszma indul (${room.code}, ${room.game}.): Világos ${room.setup.names.w}, Sötét ${room.setup.names.b}`);
     this.membersChanged(room);
@@ -553,11 +634,32 @@ export class Lobby {
     room.actions.push(action);
     room.state = r.state;
     if (room.drawOffer) room.drawOffer = null;
+    // the turn clock starts again for whoever has to act next
+    const owner = r.state.pendingPromotion?.color ?? r.state.turn;
+    if (owner !== room.turnOwner) {
+      room.turnOwner = owner;
+      room.turnSince = this.now();
+    }
     this.push(room, { type: 'action', game: room.game, n, action, by, hash: stateHash(r.state), ...(nonce ? { nonce } : {}) });
     const st = r.state.status;
     if (st.kind !== 'playing') {
       const how = st.kind === 'checkmate' ? `matt, ${st.winner === 'w' ? 'Világos' : 'Sötét'} nyert` : st.kind === 'resigned' ? `feladás, ${st.winner === 'w' ? 'Világos' : 'Sötét'} nyert` : st.kind === 'stalemate' ? 'patt' : 'döntetlen';
       this.log(`Vége (${room.code}): ${how}`);
+      if (room.ranked && room.hostColor) {
+        const hc = room.hostColor;
+        const userOf = (c: Color) => room.players[c === hc ? 'host' : 'guest']?.userId ?? null;
+        const winner = st.kind === 'checkmate' || st.kind === 'resigned' ? st.winner : null;
+        let changes: Record<Color, RatingChange> | null = null;
+        try {
+          changes = this.onRankedOver({ code: room.code, players: { w: userOf('w'), b: userOf('b') }, winner });
+        } catch (e) {
+          this.log(`Az Élő-pontszámok frissítése nem sikerült (${room.code}): ${(e as Error).message}`);
+        }
+        if (changes) {
+          room.rated = changes;
+          this.push(room, { type: 'rated', game: room.game, changes });
+        }
+      }
       this.membersChanged(room);
     }
     return { ok: true, n };
@@ -596,6 +698,10 @@ export class Lobby {
       online: { host: !!room.players.host && this.isOnline(room.players.host), guest: !!room.players.guest && this.isOnline(room.players.guest) },
       closed: room.closed,
       lastEvent: room.nextEvent - 1,
+      ranked: room.ranked ? { ...room.ranked } : null,
+      rated: room.rated,
+      forfeit: room.forfeit,
+      turnLeftMs: room.ranked && room.state?.status.kind === 'playing' ? Math.max(0, RANKED_TURN_MS - (this.now() - room.turnSince)) : null,
     };
   }
 }

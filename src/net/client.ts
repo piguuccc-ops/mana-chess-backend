@@ -4,8 +4,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import {
   BUILD_ID, DEFAULT_PORT, POLL_WAIT_MS,
-  type AccountEvent, type ActionRequest, type ColorChoice, type CreateRequest, type DeckRecord, type DrawAnswer, type JoinRequest, type MeView,
-  type NetEvent, type Ok, type PickRequest, type PollResponse, type RoomState, type RoomSummary, type Seat, type ServerInfo, type UserBrief,
+  type AccountEvent, type ActionRequest, type ColorChoice, type CreateRequest, type DeckRecord, type DrawAnswer, type JoinRequest, type LeaderRow,
+  type MeView, type NetEvent, type Ok, type PickRequest, type PollResponse, type QueueView, type RoomState, type RoomSummary, type Seat,
+  type ServerInfo, type UserBrief,
 } from './protocol';
 import type { SpellId } from '../engine';
 
@@ -277,6 +278,12 @@ export class AccountApi {
     this.post<{ seat: Seat; state: RoomState }>('/api/challenges/accept', { id, deck, deckName, build: BUILD_ID });
   declineChallenge = (id: string) => this.post('/api/challenges/decline', { id });
   cancelChallenge = (id: string) => this.post('/api/challenges/cancel', { id });
+  /** Ranked play: look for an opponent (queue null: found at once – the game comes on the stream). */
+  rankedJoin = (deck: SpellId[], deckName: string) => this.post<{ queue: QueueView | null }>('/api/ranked/join', { deck, deckName, build: BUILD_ID });
+  rankedLeave = () => this.post('/api/ranked/leave');
+  /** Asked every few seconds while searching (that keeps the place in the queue). */
+  rankedStatus = () => this.post<{ queue: QueueView | null }>('/api/ranked/status');
+  leaderboard = () => this.post<{ rows: LeaderRow[]; me: LeaderRow | null; players: number }>('/api/ranked/leaderboard');
 }
 
 /**

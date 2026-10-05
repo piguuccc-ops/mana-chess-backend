@@ -11,6 +11,13 @@ server's address into the game (**Online** in the main menu).
 - **Rooms.** Open rooms and four-letter room codes, for signed-in players and for guests. Guest play is
   "LAN mode": no account, and decks stay in the browser. Games are authoritative: the server replays every
   move with the same rules engine as the page, so a modified page cannot cheat.
+- **Ranked games with an Elo rating.** Every account has an Élő-pontszám (starts at 1000, never below 100).
+  Players who ask for an opponent are paired by the server – the longest-waiting first, with the closest
+  rating; the range widens from ±100 by 50 every 5 seconds, and after a minute anyone will do. The result moves
+  both ratings (K = 40 for a player's first 30 ranked games, then 20). Ranked games have no rematch, leaving
+  loses, and a turn clock keeps them moving: 3 minutes per turn, and a player away for a minute loses. Only
+  these matchmade games change the rating – challenges, rooms and the bots never do. Signed-in players see the
+  server's leaderboard; the control panel shows every rating and can reset one.
 - **Two game modes** for rooms and challenges: your own decks, or **Spell-toborzás** (spell draft) – 32
   random, different spells on an 8 × 4 table, and the players take one each in turn until both have 6.
   The server deals the table and checks every pick.
@@ -219,7 +226,7 @@ To report a security problem, see [SECURITY.md](SECURITY.md).
 ```bash
 npm install
 npm run dev            # tsx server/main.ts – data in ./data
-npm test               # Vitest: accounts, fail2ban, friends, challenges, rooms, HTTP
+npm test               # Vitest: accounts, fail2ban, friends, challenges, rooms, ranked play, HTTP
 npm run typecheck
 npm run build          # dist/backend.mjs + dist/healthcheck.mjs
 ```
@@ -247,8 +254,10 @@ server/
   main.ts            command line, environment, startup banner
   index.ts           the two HTTP listeners: the public API (JSON over long polling, CORS) and the
                      control panel; rate limits
-  accounts.ts        accounts, sessions, fail2ban, decks, friends, presence, challenges, admin operations
-  lobby.ts           rooms and authoritative games (every action checked with the engine)
+  accounts.ts        accounts, sessions, fail2ban, decks, friends, presence, challenges, ranked play and
+                     ratings, admin operations
+  ranked.ts          the matchmaking queue (who plays whom)
+  lobby.ts           rooms and authoritative games (every action checked with the engine), the ranked turn clock
   store.ts           the JSON data file (atomic, debounced writes)
   security.ts        scrypt, tokens, address bans, client address behind a proxy
   adminApp.ts        the control panel (sent to the browser as plain JavaScript)

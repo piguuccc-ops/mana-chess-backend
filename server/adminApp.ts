@@ -302,6 +302,7 @@ export function adminApp(): void {
         stat('jóváhagyásra vár', s.pending, s.pending ? 'is-hot' : '', s.pending ? goUsers('pending') : undefined),
         stat('online most', s.online, 'is-mana'),
         stat('nyitott szoba', s.rooms),
+        stat('rangsorolt keresés', s.searching ?? 0, s.searching ? 'is-mana' : ''),
         stat('zárolt fiók', s.locked, s.locked ? 'is-warn' : '', s.locked ? goUsers('locked') : undefined),
         stat('kitiltott cím', s.bans, s.bans ? 'is-warn' : ''),
       ),
@@ -348,7 +349,7 @@ export function adminApp(): void {
                     h('td', { class: 'mono' }, r.code),
                     h('td', null, r.host),
                     h('td', null, r.guest || '–'),
-                    h('td', null, r.running ? r.game + '. játszma fut' : r.guest ? 'vége' : 'várakozik'),
+                    h('td', null, r.running ? r.game + '. játszma fut' : r.guest ? 'vége' : 'várakozik', r.ranked ? h('span', { class: 'pill pill-gold' }, 'rangsorolt') : null),
                     h('td', null, dur(r.age)),
                   ),
                 ),
@@ -445,6 +446,14 @@ export function adminApp(): void {
                 ),
           );
         if (u.sessions) actions.push(btn('Kijelentkeztetés', () => void act('/api/admin/users/signout', { id: u.id }, u.name + ' kijelentkeztetve.')));
+        if (u.rankedGames > 0 || u.rating !== 1000)
+          actions.push(
+            btn('Élő visszaállítása', () =>
+              dialog('Visszaállítod ' + u.name + ' Élő-pontszámát?', h('p', null, 'A pontszám újra 1000 lesz, a rangsorolt eredményei (' + u.rankedGames + ' játszma) törlődnek. A ranglistáról is lekerül, amíg újra nem játszik.'), [
+                { label: 'Visszaállítás', tone: 'btn-danger', run: () => act('/api/admin/users/rating', { id: u.id }, u.name + ' Élő-pontszáma visszaállítva.') },
+              ]),
+            ),
+          );
         if (u.id !== d.me.id)
           actions.push(
             btn(
@@ -465,6 +474,7 @@ export function adminApp(): void {
         h('td', { 'data-label': 'Regisztrált' }, when(u.createdAt)),
         h('td', { 'data-label': 'Utoljára belépett' }, when(u.lastLogin)),
         h('td', { 'data-label': 'Paklik / barátok', class: 'num' }, u.decks + ' / ' + u.friends),
+        h('td', { 'data-label': 'Élő (játszma)', class: 'num' }, u.status === 'pending' ? '–' : u.rating + ' (' + u.rankedGames + ')'),
         h('td', { 'data-label': 'Műveletek', class: 'actions' }, ...actions),
       );
     });
@@ -506,7 +516,7 @@ export function adminApp(): void {
           ? h(
               'table',
               { class: 'table users' },
-              h('thead', null, h('tr', null, h('th', null, 'Név'), h('th', null, 'Állapot'), h('th', null, 'Regisztrált'), h('th', null, 'Utoljára belépett'), h('th', null, 'Paklik / barátok'), h('th', null, ''))),
+              h('thead', null, h('tr', null, h('th', null, 'Név'), h('th', null, 'Állapot'), h('th', null, 'Regisztrált'), h('th', null, 'Utoljára belépett'), h('th', null, 'Paklik / barátok'), h('th', null, 'Élő (játszma)'), h('th', null, ''))),
               h('tbody', null, ...rows),
             )
           : h('p', { class: 'hint' }, userView === 'pending' ? 'Nincs jóváhagyásra váró regisztráció.' : 'Nincs ilyen felhasználó.'),

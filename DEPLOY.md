@@ -292,6 +292,12 @@ Always update the backend and the game page **together** (the command above does
 away a game page built with different rules, and says so. **Never run `docker compose down -v`**: the
 `-v` deletes the data volume, which holds every account.
 
+**The version with bots, ranked play and the Android app** needs nothing special: the same
+`docker-compose.yml`, the same volume. On its first start every existing account gets an Élő-pontszám of
+1000 (and an empty ranked record); nothing else in the data changes. Players of the **Android app** need the
+APK of the same release (the app shows an „Az alkalmazás frissítése” button when it no longer matches the
+server).
+
 To go back to an older version, put its tag (e.g. `:1.0.0`) in both `image:` lines and run
 `docker compose up -d`. If the data itself must go back, restore the backup (step 7).
 
@@ -348,6 +354,17 @@ docker compose run --rm --service-ports backend --setup
 
 **Where the data is on disk:** `docker volume inspect mana-chess-data` shows the folder (normally
 `/var/lib/docker/volumes/mana-chess-data/_data`, readable only with `sudo`).
+
+**Ratings.** The control panel's user list shows every player's Élő-pontszám and ranked games; *Élő
+visszaállítása* puts one back to 1000 (e.g. after abuse). The *rangsorolt keresés* number on its front page
+shows how many players are looking for an opponent right now.
+
+**The Android app for your players.** In the game repository (**mana-chess-frontend**) on GitHub, once:
+add the signing key as secrets and your server's address as the variable `MANA_BACKEND` (Settings →
+Secrets and variables → Actions – the exact names are in `android/README.md`). From then on every version
+tag (`v1.2.0`) puts `mana-chess-v1.2.0.apk` on the release page, already pointing at your server. Players
+download it on the phone, allow installing from this source once, and install; an update is installed over
+the old one and keeps their decks and settings.
 
 ---
 

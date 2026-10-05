@@ -18,6 +18,7 @@
 //   POST /api/decks/(save|delete)
 //   POST /api/friends/(search|request|accept|decline|cancel|remove)
 //   POST /api/challenges/(send|accept|decline|cancel)
+//   POST /api/ranked/(join|leave|status|leaderboard)   matchmaking for ranked games, the leaderboard
 //
 //  the control panel (port 5555) – keep it on the server's own machine (or a private network such
 //  as Tailscale); nothing of it exists on the backend's port:
@@ -158,6 +159,7 @@ const SESSION_PATHS = new Set([
   '/api/me', '/api/me/poll', '/api/me/password', '/api/decks/save', '/api/decks/delete',
   '/api/friends/search', '/api/friends/request', '/api/friends/accept', '/api/friends/decline', '/api/friends/cancel', '/api/friends/remove',
   '/api/challenges/send', '/api/challenges/accept', '/api/challenges/decline', '/api/challenges/cancel',
+  '/api/ranked/join', '/api/ranked/leave', '/api/ranked/status', '/api/ranked/leaderboard',
 ]);
 
 export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
@@ -317,6 +319,14 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
         return send(res, 200, accounts.declineChallenge(user, body));
       case '/api/challenges/cancel':
         return send(res, 200, accounts.cancelChallenge(user, body));
+      case '/api/ranked/join':
+        return send(res, 200, accounts.rankedJoin(user, body));
+      case '/api/ranked/leave':
+        return send(res, 200, accounts.rankedLeave(user));
+      case '/api/ranked/status':
+        return send(res, 200, accounts.rankedStatus(user));
+      case '/api/ranked/leaderboard':
+        return send(res, 200, accounts.leaderboard(user));
     }
     return send(res, 404, { ok: false, error: 'Nincs ilyen cím.' });
   };
@@ -397,6 +407,8 @@ export function startBackend(opts: BackendOptions): Promise<RunningBackend> {
           return send(res, 200, accounts.setRole(user, body));
         case '/api/admin/users/signout':
           return send(res, 200, accounts.signOutEverywhere(body));
+        case '/api/admin/users/rating':
+          return send(res, 200, accounts.resetRating(body));
         case '/api/admin/bans/remove': {
           const ipToFree = typeof body.ip === 'string' ? body.ip : '';
           const freed = accounts.guard.unban(ipToFree);

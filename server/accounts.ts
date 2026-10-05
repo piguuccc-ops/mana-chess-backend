@@ -1,17 +1,20 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Accounts on the backend: registering (closed / with the admin's approval / open), signing in
 // with the built-in fail2ban, sessions, the decks kept on the server, friends and friend
-// requests, challenges between friends, each account's own event stream (long-polled like a
-// room), presence, and the control panel's operations. No HTTP here – see index.ts.
+// requests, challenges between friends, ranked play (matchmaking and the Élő-pontszám), each
+// account's own event stream (long-polled like a room), presence, and the control panel's
+// operations. No HTTP here – see index.ts.
 // ─────────────────────────────────────────────────────────────────────────────
 import { timingSafeEqual } from 'node:crypto';
 import type { SpellId } from '../src/engine';
+import type { Color } from '../src/engine';
 import {
-  DECKS_MAX, PASSWORD_MAX, PASSWORD_MIN, USERNAME_MAX, USERNAME_MIN,
-  type AccountEvent, type AccountRole, type ChallengeView, type ColorChoice, type DeckRecord, type FriendView, type MeView,
-  type Ok, type Presence, type RegistrationMode, type RoomState, type Seat, type UserBrief,
+  DECKS_MAX, eloAfter, PASSWORD_MAX, PASSWORD_MIN, RATING_START, USERNAME_MAX, USERNAME_MIN,
+  type AccountEvent, type AccountRole, type ChallengeView, type ColorChoice, type DeckRecord, type FriendView, type LeaderRow, type MeView,
+  type Ok, type Presence, type QueueView, type RatingChange, type RegistrationMode, type RoomState, type Seat, type UserBrief,
 } from '../src/net/protocol';
-import { cleanDeck, cleanText, Lobby, sameBuild, versionError, type Member } from './lobby';
+import { cleanDeck, cleanText, Lobby, sameBuild, versionError, type Member, type RankedResult } from './lobby';
+import { Matchmaker } from './ranked';
 import { dummyHash, Guard, hashPassword, IP_MAX_FAILS, newId, newToken, setupCode, tokenHash, verifyPassword } from './security';
 import { Store, type Settings, type StoredUser } from './store';
 
@@ -26,6 +29,7 @@ const EVENTS_KEEP = 100;
 const FRIENDS_MAX = 200;
 const REQUESTS_MAX = 50;
 const DECK_DESC_MAX = 200;
+const LEADERBOARD_ROWS = 50;
 
 type Fail = { ok: false; error: string };
 const fail = (error: string): Fail => ({ ok: false, error });
@@ -47,6 +51,8 @@ export function passwordError(pw: string): string | null {
   return null;
 }
 const keyOf = (name: string) => name.normalize('NFC').toLocaleLowerCase('hu');
+/** Ranked games played. */
+const gamesOf = (u: StoredUser) => u.ranked.w + u.ranked.l + u.ranked.d;
 
 interface Stream {
   events: AccountEvent[];
@@ -85,10 +91,15 @@ export interface AdminUser {
   friends: number;
   presence: Presence;
   sessions: number;
+  /** Élő-pontszám and ranked games played. */
+  rating: number;
+  rankedGames: number;
 }
 
 export class Accounts {
   readonly guard: Guard;
+  /** Players looking for a ranked game. */
+  readonly matchmaker: Matchmaker;
   private streams = new Map<string, Stream>();
   private challenges = new Map<string, Challenge>();
   private announced = new Map<string, Presence>();
@@ -102,9 +113,12 @@ export class Accounts {
     private readonly now: () => number = () => Date.now(),
   ) {
     this.guard = new Guard(() => store.data.bans, () => store.changed(), now, log);
+    this.matchmaker = new Matchmaker(now);
     if (!this.hasAdmin()) this.setupCode = setupCode();
     // a game of theirs opened, started, ended or closed: their lobby fetches the list again
     lobby.onMembersChanged = (ids) => ids.forEach((id) => this.push(id, { type: 'refresh' }));
+    // a ranked game ended: the two ratings change
+    lobby.onRankedOver = (r) => this.rateGame(r);
   }
 
   get settings(): Settings {
@@ -297,6 +311,8 @@ export class Accounts {
       requestsOut: [],
       failed: 0,
       lockedUntil: 0,
+      rating: RATING_START,
+      ranked: { w: 0, l: 0, d: 0 },
     };
     // a name may have been taken while the password was being hashed
     if (this.byName(name)) throw new Error('Ez a név már foglalt.');
@@ -336,12 +352,20 @@ export class Accounts {
     const friends: FriendView[] = user.friends
       .map((id) => this.byId(id))
       .filter((f): f is StoredUser => !!f)
-      .map((f) => ({ ...this.brief(f), status: this.presenceOf(f.id) }))
+      .map((f) => ({ ...this.brief(f), status: this.presenceOf(f.id), rating: f.rating }))
       .sort((a, b) => order[a.status] - order[b.status] || a.name.localeCompare(b.name, 'hu'));
     const people = (ids: string[]) => ids.map((id) => this.byId(id)).filter((u): u is StoredUser => !!u).map(this.brief);
     const challenges = [...this.challenges.values()];
     return {
-      user: { id: user.id, name: user.name, role: user.role, createdAt: user.createdAt },
+      user: {
+        id: user.id,
+        name: user.name,
+        role: user.role,
+        createdAt: user.createdAt,
+        rating: user.rating,
+        ranked: { ...user.ranked },
+        rank: this.rankOf(user),
+      },
       decks: user.decks,
       friends,
       requestsIn: people(user.requestsIn),
@@ -562,6 +586,106 @@ export class Accounts {
     return { ok: true };
   }
 
+  // ── Ranked play ──────────────────────────────────────────────────────────
+
+  /** Looks for an opponent (the answer's `queue` is null when one was found at once – the game comes on the stream). */
+  rankedJoin(user: StoredUser, body: unknown): Ok<{ queue: QueueView | null }> {
+    if (!isObj(body)) return fail('Érvénytelen kérés.');
+    if (!sameBuild(body.build)) return fail(versionError(body.build));
+    if (this.lobby.hasRunningGame(user.id)) return fail('Előbb fejezd be a futó játszmádat – a Játék fülön, a Folytatásnál éred el.');
+    const deck = cleanDeck(body.deck);
+    if (typeof deck === 'string') return fail(deck);
+    const again = this.matchmaker.has(user.id);
+    this.matchmaker.join(user.id, deck, cleanText(body.deckName, 32, 'Pakli'));
+    if (!again) this.log(`Rangsorolt keresés: ${user.name} (${user.rating})`);
+    this.matchmake();
+    return { ok: true, queue: this.matchmaker.view(user.id) };
+  }
+
+  rankedLeave(user: StoredUser): Ok {
+    if (this.matchmaker.leave(user.id)) this.log(`Rangsorolt keresés vége: ${user.name}`);
+    return { ok: true };
+  }
+
+  /** The searching page asks every few seconds (that keeps its place); null: not in the queue (any more). */
+  rankedStatus(user: StoredUser): Ok<{ queue: QueueView | null }> {
+    this.matchmaker.seen(user.id);
+    return { ok: true, queue: this.matchmaker.view(user.id) };
+  }
+
+  /** The best players (with at least one ranked game), and the asking player's own row. */
+  leaderboard(user: StoredUser): Ok<{ rows: LeaderRow[]; me: LeaderRow | null; players: number }> {
+    const ranked = this.users
+      .filter((u) => u.status === 'active' && gamesOf(u) > 0)
+      .sort((a, b) => b.rating - a.rating || gamesOf(b) - gamesOf(a) || a.name.localeCompare(b.name, 'hu'));
+    const row = (u: StoredUser): LeaderRow => ({
+      rank: 1 + ranked.filter((x) => x.rating > u.rating).length,
+      name: u.name,
+      rating: u.rating,
+      games: gamesOf(u),
+      ...u.ranked,
+      ...(u.id === user.id ? { me: true } : {}),
+    });
+    const mine = ranked.find((u) => u.id === user.id);
+    return { ok: true, rows: ranked.slice(0, LEADERBOARD_ROWS).map(row), me: mine ? row(mine) : null, players: ranked.length };
+  }
+
+  /** Place on the leaderboard (ties share a place); null before the first ranked game. */
+  rankOf(user: StoredUser): number | null {
+    if (!gamesOf(user)) return null;
+    return 1 + this.users.filter((u) => u.status === 'active' && gamesOf(u) > 0 && u.rating > user.rating).length;
+  }
+
+  /** Pairs the players waiting in the queue and opens their rooms (on joining, and every few seconds). */
+  private matchmake(): void {
+    this.matchmaker.sweep();
+    const pairs = this.matchmaker.pairs(
+      (id) => this.byId(id)?.rating ?? RATING_START,
+      (a, b) => !!this.byId(a.userId) && !!this.byId(b.userId) && !this.lobby.hasRunningGame(a.userId) && !this.lobby.hasRunningGame(b.userId),
+    );
+    for (const [a, b] of pairs) {
+      const ua = this.byId(a.userId);
+      const ub = this.byId(b.userId);
+      if (!ua || !ub) continue;
+      const r = this.lobby.direct(
+        { member: this.member(ua), deck: a.deck, deckName: a.deckName },
+        { member: this.member(ub), deck: b.deck, deckName: b.deckName },
+        'random',
+        true,
+        false,
+        { host: ua.rating, guest: ub.rating },
+      );
+      this.push(ua.id, { type: 'game', seat: r.host.seat, state: r.host.state, ranked: true });
+      this.push(ub.id, { type: 'game', seat: r.guest.seat, state: r.guest.state, ranked: true });
+    }
+  }
+
+  /** A ranked game is over: both ratings move (Elo; K = 40 for the first 30 games, then 20). */
+  private rateGame(r: RankedResult): Record<Color, RatingChange> | null {
+    const w = r.players.w ? this.byId(r.players.w) : undefined;
+    const b = r.players.b ? this.byId(r.players.b) : undefined;
+    if (!w || !b || w.id === b.id) return null;
+    const score: 0 | 0.5 | 1 = r.winner === 'w' ? 1 : r.winner === 'b' ? 0 : 0.5;
+    const before = { w: w.rating, b: b.rating };
+    const after = { w: eloAfter(before.w, before.b, score, gamesOf(w)), b: eloAfter(before.b, before.w, (1 - score) as 0 | 0.5 | 1, gamesOf(b)) };
+    w.rating = after.w;
+    b.rating = after.b;
+    if (r.winner === 'w') {
+      w.ranked.w += 1;
+      b.ranked.l += 1;
+    } else if (r.winner === 'b') {
+      b.ranked.w += 1;
+      w.ranked.l += 1;
+    } else {
+      w.ranked.d += 1;
+      b.ranked.d += 1;
+    }
+    this.store.changed();
+    const sign = (n: number) => (n >= 0 ? `+${n}` : String(n));
+    this.log(`Élő-pontszám (${r.code}): ${w.name} ${before.w} → ${after.w} (${sign(after.w - before.w)}), ${b.name} ${before.b} → ${after.b} (${sign(after.b - before.b)})`);
+    return { w: { before: before.w, after: after.w }, b: { before: before.b, after: after.b } };
+  }
+
   // ── Each account's event stream ──────────────────────────────────────────
 
   private stream(userId: string): Stream {
@@ -629,6 +753,7 @@ export class Accounts {
       for (const f of u.friends) if (this.streams.has(f)) this.push(f, { type: 'presence', userId: u.id, status: p });
     }
     this.guard.sweep(this.lockMs);
+    this.matchmake();
     // streams of deleted accounts, and ones nobody has polled for a day
     for (const [id, s] of this.streams) if (!s.polls && !s.waiters.size && (!this.byId(id) || t - s.lastSeen > DAY)) this.streams.delete(id);
   }
@@ -652,6 +777,8 @@ export class Accounts {
         friends: u.friends.length,
         presence: this.presenceOf(u.id),
         sessions: sessions.filter((s) => s.userId === u.id).length,
+        rating: u.rating,
+        rankedGames: gamesOf(u),
       }))
       .sort((a, b) => Number(b.status === 'pending') - Number(a.status === 'pending') || a.name.localeCompare(b.name, 'hu'));
   }
@@ -729,6 +856,7 @@ export class Accounts {
       if (other && !touched.includes(other)) touched.push(other);
     }
     this.lobby.removeMember(u.id);
+    this.matchmaker.leave(u.id);
     this.store.data.users = this.users.filter((x) => x.id !== u.id);
     this.endSessions(u.id, 'A fiókodat törölték a szerverről.');
     for (const o of touched) this.push(o.id, { type: 'refresh' });
@@ -776,6 +904,18 @@ export class Accounts {
     return { ok: true };
   }
 
+  /** The control panel puts a player's Élő-pontszám back to the start (and clears the ranked results). */
+  resetRating(body: unknown): Ok {
+    const u = isObj(body) ? this.byId(body.id) : undefined;
+    if (!u) return fail('Nincs ilyen felhasználó.');
+    u.rating = RATING_START;
+    u.ranked = { w: 0, l: 0, d: 0 };
+    this.store.changed();
+    this.push(u.id, { type: 'refresh' });
+    this.log(`Élő-pontszám visszaállítva: ${u.name} (${RATING_START})`);
+    return { ok: true };
+  }
+
   signOutEverywhere(body: unknown): Ok {
     const u = isObj(body) ? this.byId(body.id) : undefined;
     if (!u) return fail('Nincs ilyen felhasználó.');
@@ -794,6 +934,7 @@ export class Accounts {
       locked: this.users.filter((u) => u.lockedUntil > this.now()).length,
       bans: this.store.data.bans.filter((b) => b.until > this.now()).length,
       ipMaxFails: IP_MAX_FAILS,
+      searching: this.matchmaker.size,
     };
   }
 }

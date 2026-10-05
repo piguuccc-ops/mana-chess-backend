@@ -578,6 +578,8 @@ function isMoveLegal(state: GameState, ctx: RulesCtx, move: Move, color: Color):
 export interface MoveOptions {
   /** Ignore the turn-phase checks (used by perft/AI helpers). */
   ignorePhase?: boolean;
+  /** Only the captures (the bots' quiescence search; skips checking every quiet move). */
+  capturesOnly?: boolean;
 }
 
 /** All legal normal chess moves of the side to move, honouring every effect. */
@@ -642,6 +644,7 @@ function legalMovesFromSquare(state: GameState, ctx: RulesCtx, s: Square, opts: 
   const noPromotion = p.type === 'P' && promotionChoices(state, color).length === 0;
   const out: Move[] = [];
   for (const t of pieceTargets(state, ctx, s, 'moves')) {
+    if (opts.capturesOnly && !t.capture) continue;
     if (rooted && !t.capture) continue;
     if (noCapture && t.capture) continue;
     if (p.type === 'P' && !pawnSquareOk(color, t.to) && rankOf(t.to) !== promotionRank(color)) continue;
@@ -651,7 +654,7 @@ function legalMovesFromSquare(state: GameState, ctx: RulesCtx, s: Square, opts: 
     out.push(m);
   }
   // „Akna”: a king may defuse a mine next to it as its move (if it cannot simply step onto it).
-  if (p.type === 'K' && ctx.mines.size) {
+  if (p.type === 'K' && ctx.mines.size && !opts.capturesOnly) {
     for (const mSq of ctx.mines) {
       if (chebyshev(s, mSq) !== 1 || out.some((m) => m.to === mSq)) continue;
       const m: Move = { from: s, to: mSq, defuse: true };

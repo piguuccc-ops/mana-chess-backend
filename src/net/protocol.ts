@@ -163,6 +163,14 @@ export interface RoomState {
   closed: string | null;
   /** Id of the last event so far: poll from here. */
   lastEvent: number;
+  /** A ranked (matchmade) game: both players' Élő-pontszám at its start. Null: a friendly game. */
+  ranked: Record<Role, number> | null;
+  /** A ranked game that has ended: the new ratings. */
+  rated: Record<Color, RatingChange> | null;
+  /** A ranked game lost on the clock or by being away. */
+  forfeit: { by: Color; reason: ForfeitReason } | null;
+  /** A ranked game in progress: what is left of the current turn (ms). */
+  turnLeftMs: number | null;
 }
 
 export type NetEvent =
@@ -175,7 +183,11 @@ export type NetEvent =
   | { id: number; type: 'rematch'; game: number; by: Role }
   | { id: number; type: 'presence'; role: Role; online: boolean }
   | { id: number; type: 'left'; role: Role; name: string }
-  | { id: number; type: 'closed'; reason: string };
+  | { id: number; type: 'closed'; reason: string }
+  /** A ranked game is over: the new ratings (sent right after the last action). */
+  | { id: number; type: 'rated'; game: number; changes: Record<Color, RatingChange> }
+  /** A ranked game is lost for running out of time on a turn, or for being away too long (a RESIGN follows). */
+  | { id: number; type: 'forfeit'; game: number; by: Color; reason: ForfeitReason };
 
 export interface PollResponse {
   events: NetEvent[];
@@ -220,6 +232,8 @@ export interface UserBrief {
 
 export interface FriendView extends UserBrief {
   status: Presence;
+  /** Élő-pontszám (ranked games only). */
+  rating: number;
 }
 
 /** A deck kept on the server for an account. */
@@ -255,11 +269,24 @@ export interface MyGame {
   game: number;
   /** The game is being played or drafted (not waiting, not over). */
   running: boolean;
+  /** A ranked (matchmade) game. */
+  ranked: boolean;
 }
 
 /** Everything the lobby shows about the signed-in player. */
 export interface MeView {
-  user: { id: string; name: string; role: AccountRole; createdAt: number };
+  user: {
+    id: string;
+    name: string;
+    role: AccountRole;
+    createdAt: number;
+    /** Élő-pontszám: changes only in ranked (matchmade) games. */
+    rating: number;
+    /** Ranked results so far. */
+    ranked: RankedRecord;
+    /** Place on the server's leaderboard (null: no ranked game yet). */
+    rank: number | null;
+  };
   decks: DeckRecord[];
   friends: FriendView[];
   requestsIn: UserBrief[];
@@ -272,11 +299,83 @@ export interface MeView {
 /**
  * The signed-in player's own stream (long-polled like a room): `refresh` – something in the
  * profile changed, fetch it again (with a note to show, e.g. „X kihívott”); `presence` – a friend
- * came, went or sat down to play; `game` – a challenge was accepted, here is the seat;
- * `signedOut` – the session ended (logged out elsewhere, account removed).
+ * came, went or sat down to play; `game` – a challenge was accepted, or matchmaking found an
+ * opponent (`ranked`), here is the seat; `signedOut` – the session ended (logged out elsewhere,
+ * account removed).
  */
 export type AccountEvent =
   | { id: number; type: 'refresh'; notice?: string }
   | { id: number; type: 'presence'; userId: string; status: Presence }
-  | { id: number; type: 'game'; seat: Seat; state: RoomState }
+  | { id: number; type: 'game'; seat: Seat; state: RoomState; ranked?: boolean }
   | { id: number; type: 'signedOut'; reason: string };
+
+// ── Ranked play (skill-based matchmaking) ─────────────────────────────────────
+//
+// Every account has an Élő-pontszám (Elo rating). Only ranked games change it: two players who
+// asked for an opponent are paired by the server, closest ratings first. Games against friends,
+// in rooms or against the bots never touch it.
+
+/** Everyone starts here, and nobody falls below the floor. */
+export const RATING_START = 1000;
+export const RATING_FLOOR = 100;
+/** The first games move the rating faster (K = 40, then K = 20), so a new player soon finds their level. */
+export const PROVISIONAL_GAMES = 30;
+/** Ranked games: the player to move loses after this long on one turn (spells included)… */
+export const RANKED_TURN_MS = 180_000;
+/** …and a player whose page has lost the server for this long loses. */
+export const RANKED_AWAY_MS = 60_000;
+/** Matchmaking: the rating range searched widens while a player waits, and after a minute anyone will do. */
+export const QUEUE_RANGE_START = 100;
+export const QUEUE_RANGE_STEP = 50;
+export const QUEUE_RANGE_EVERY_MS = 5000;
+export const QUEUE_ANYONE_AFTER_MS = 60_000;
+
+export type ForfeitReason = 'time' | 'away';
+
+export interface RankedRecord {
+  w: number;
+  l: number;
+  d: number;
+}
+
+export interface RatingChange {
+  before: number;
+  after: number;
+}
+
+/** The matchmaking queue as a waiting player sees it. */
+export interface QueueView {
+  /** Seconds in the queue so far. */
+  waited: number;
+  /** ± this many points are searched now; null: anyone. */
+  range: number | null;
+  /** Players searching right now (this one included). */
+  searching: number;
+}
+
+export interface LeaderRow {
+  rank: number;
+  name: string;
+  rating: number;
+  games: number;
+  w: number;
+  l: number;
+  d: number;
+  /** The signed-in player's own row. */
+  me?: boolean;
+}
+
+/** The range searched after waiting `ms` (null: anyone). */
+export function queueRange(ms: number): number | null {
+  if (ms >= QUEUE_ANYONE_AFTER_MS) return null;
+  return QUEUE_RANGE_START + QUEUE_RANGE_STEP * Math.floor(Math.max(0, ms) / QUEUE_RANGE_EVERY_MS);
+}
+
+/** The expected score of a player rated `a` against one rated `b` (0…1). */
+export const eloExpected = (a: number, b: number): number => 1 / (1 + Math.pow(10, (b - a) / 400));
+
+/** The rating after one game: `score` 1 win, ½ draw, 0 loss; `games` = ranked games played before it. */
+export function eloAfter(rating: number, opponent: number, score: 0 | 0.5 | 1, games: number): number {
+  const k = games < PROVISIONAL_GAMES ? 40 : 20;
+  return Math.max(RATING_FLOOR, Math.round(rating + k * (score - eloExpected(rating, opponent))));
+}

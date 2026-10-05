@@ -22,6 +22,10 @@ maintainer privately.
   - Bodies are limited to 64 KB.
   - Every field is cleaned.
   - Every game action is checked by the server's own rules engine.
+- **Ranked play.**
+  - Matchmaking, ratings and the leaderboard need a signed-in session; ratings change only on the server,
+    from the result of a game it refereed itself.
+  - A ranked game cannot be stalled: 3 minutes per turn, a minute away, and leaving all count as a loss.
 - **Control panel.**
   - A separate listener on its own port (5555), bound to `127.0.0.1`; `docker-compose.yml` publishes it on
     the server's `127.0.0.1` only. The public port (5454) has no admin page and no admin API.

@@ -1,8 +1,9 @@
 ﻿MANA CHESS BACKEND
 ==================
 
-Fiókok, a fiókok paklijai, barátok és jelölések, kihívások, játékszobák (5454-es port) – és a
-vezérlőpult, külön porton (5555), csak erről a gépről. Sima HTTP-szerver; interneten
+Fiókok, a fiókok paklijai, barátok és jelölések, kihívások, játékszobák, rangsorolt játék
+Élő-pontszámmal és párosítással (5454-es port) – és a vezérlőpult, külön porton (5555), csak
+erről a gépről. Sima HTTP-szerver; interneten
 Nginx Proxy Manager (NPM) adja elé a HTTPS-t – de csak az 5454-es port elé.
 
 
@@ -54,7 +55,8 @@ Másik gépről:
 
   Áttekintés     játékosok, jóváhagyásra várók, ki van online, nyitott szobák
   Felhasználók   új fiók kézzel (azonnal használható, lehet admin is), jóváhagyás,
-                 elutasítás, új jelszó, admin jog, kijelentkeztetés, törlés
+                 elutasítás, új jelszó, admin jog, kijelentkeztetés, törlés,
+                 Élő-pontszám (rangsorolt játszmák) és visszaállítása
   Beállítások    a szerver neve; regisztráció: zárva / jóváhagyással / nyitott;
                  vendégjáték be/ki; fail2ban határok; proxy-fejlécek
   Biztonság      zárolt fiókok és kitiltott címek – feloldás egy gombbal
